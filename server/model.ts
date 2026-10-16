@@ -44,6 +44,20 @@ export const aiSettingsSchema = aiConfigSchema.omit({ apiKey: true }).extend({ a
 // failures/retryAt belong to queue execution; reads have an independent failure streak.
 export const settingsSchema = z.object({ limits: limitsSchema, running: z.boolean(), pauseReason: z.string(), failures: z.number(), retryAt: z.number(), readFailures: z.number().default(0), readRetryAt: z.number().default(0), nextInteraction: z.number(), lastContent: z.string(), account: accountSchema, ai: aiSettingsSchema.default({}) });
 export type Settings = z.infer<typeof settingsSchema>;
+export const queueSummarySchema = z.object({
+  pending: z.number().int().nonnegative(),
+  due: z.number().int().nonnegative(),
+  nextDueAt: z.number().int().nullable(),
+  scheduled: z.number().int().nonnegative(),
+  waitingTemplate: z.number().int().nonnegative(),
+  pausedChannel: z.number().int().nonnegative(),
+  claimed: z.number().int().nonnegative(),
+  uncertain: z.number().int().nonnegative(),
+  manualReview: z.number().int().nonnegative(),
+  overdue: z.number().int().nonnegative(),
+  earliestOverdueAt: z.number().int().nullable(),
+});
+export type QueueSummary = z.infer<typeof queueSummarySchema>;
 /** Persistent interaction plan and attempt contracts.  These are deliberately
  * independent from the legacy `interactions` queue table so retries never
  * overwrite an earlier send attempt. */

@@ -32,6 +32,28 @@ test('new plan creation binds UID, atomically deduplicates BV/AV, and claim free
   } finally { store.close(); }
 });
 
+test('queue summary separates due, future, blocked and in-flight plans', () => {
+  const store = new Store(':memory:');
+  try {
+    const topicId = store.saveTopic(topicSchema.parse({ name: '队列摘要', enabled: true, keywords: ['测试'] }));
+    assert.equal(store.bindAccount('10001', true).ok, true);
+    const now = day + 3 * 60 * 60 * 1000;
+    const create = (number: number) => store.createInteractionPlan({
+      video: { ...video, bvid: `BV${String(number).padStart(10, '0')}`, aid: number }, topicId, ownerUid: '10001', topicName: '队列摘要', keyword: '测试', matchedField: 'title', plannedAction: 'comment', commentTemplates: ['评论'], replyTemplates: ['回复'], createdAt: day, dueAt: now + 3600000, cycleStartDay: dayStart(day), cycleDeadlineDay: dayStart(day) + 30 * 86400000,
+    });
+    const due = create(401)!; create(402)!; const waiting = create(403)!; const paused = create(404)!; const claimed = create(405)!; const uncertain = create(406)!; const manual = create(407)!; const overdue = create(408)!;
+    store.db.prepare('UPDATE interaction_plans SET due_at=? WHERE id=?').run(now - 1000, due.id);
+    store.db.prepare("UPDATE interaction_plans SET state='waiting_template' WHERE id=?").run(waiting.id);
+    store.db.prepare("UPDATE interaction_plans SET state='paused_channel' WHERE id=?").run(paused.id);
+    store.db.prepare("UPDATE interaction_plans SET state='claimed' WHERE id=?").run(claimed.id);
+    store.db.prepare("UPDATE interaction_plans SET state='uncertain' WHERE id=?").run(uncertain.id);
+    store.db.prepare("UPDATE interaction_plans SET state='manual_review' WHERE id=?").run(manual.id);
+    store.db.prepare("UPDATE interaction_plans SET due_at=?,cycle_deadline_day=?,overflow=0 WHERE id=?").run(now - 1000, dayStart(now) - 86400000, overdue.id);
+    const summary = store.queueSummary(now);
+    assert.deepEqual(summary, { pending: 5, due: 2, nextDueAt: now - 1000, scheduled: 3, waitingTemplate: 1, pausedChannel: 1, claimed: 1, uncertain: 1, manualReview: 1, overdue: 1, earliestOverdueAt: dayStart(now) - 86400000 });
+  } finally { store.close(); }
+});
+
 test('confirmed failures append an attempt, keep the original action and template snapshots, and use the next cycle', () => {
   const store = new Store(':memory:');
   try {

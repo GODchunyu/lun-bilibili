@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, chmodSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync, fsyncSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 import { z } from 'zod';
-import { dayStart, limitsSchema, topicSchema, accountSchema, settingsSchema, aiConfigSchema, activitySchema, videoSchema, postReceiptSchema, interactionActionSchema, interactionStateSchema, dispatchClassSchema, attemptStatusSchema, failureStageSchema, type AiConfig, type Topic, type TopicConfig, type Template, type Settings, type Activity, type Video, type RecentComment, type InteractionState, type AttemptStatus, type InteractionPlan, type InteractionAttempt } from './model.js';
+import { dayStart, limitsSchema, topicSchema, accountSchema, settingsSchema, aiConfigSchema, activitySchema, videoSchema, postReceiptSchema, interactionActionSchema, interactionStateSchema, dispatchClassSchema, attemptStatusSchema, failureStageSchema, queueSummarySchema, type AiConfig, type Topic, type TopicConfig, type Template, type Settings, type Activity, type Video, type RecentComment, type InteractionState, type AttemptStatus, type InteractionPlan, type InteractionAttempt, type QueueSummary } from './model.js';
 const dataRow = z.object({ data: z.string() });
 const countRow = z.object({ n: z.number() });
 const queueSchema = z.object({ id: z.number(), bvid: z.string(), topic_id: z.number(), action: z.enum(['comment','reply']), state: z.string(), due: z.number(), video: z.string(), keyword: z.string() });
@@ -336,6 +336,26 @@ export class Store {
   interactionPlanCount(state?:InteractionState) {
     const value=state?interactionStateSchema.parse(state):null;
     return countRow.parse(this.db.prepare('SELECT count(*) AS n FROM interaction_plans WHERE (? IS NULL OR state=?)').get(value,value)).n;
+  }
+  queueSummary(now=Date.now()): QueueSummary {
+    const today=dayStart(now);
+    const row=this.db.prepare(`SELECT
+      coalesce(sum(CASE WHEN state IN ('scheduled','waiting_template','paused_channel') THEN 1 ELSE 0 END),0) AS pending,
+      coalesce(sum(CASE WHEN state='scheduled' AND due_at<=? THEN 1 ELSE 0 END),0) AS due,
+      min(CASE WHEN state='scheduled' THEN due_at END) AS next_due_at,
+      coalesce(sum(CASE WHEN state='scheduled' THEN 1 ELSE 0 END),0) AS scheduled,
+      coalesce(sum(CASE WHEN state='waiting_template' THEN 1 ELSE 0 END),0) AS waiting_template,
+      coalesce(sum(CASE WHEN state='paused_channel' THEN 1 ELSE 0 END),0) AS paused_channel,
+      coalesce(sum(CASE WHEN state='claimed' THEN 1 ELSE 0 END),0) AS claimed,
+      coalesce(sum(CASE WHEN state='uncertain' THEN 1 ELSE 0 END),0) AS uncertain,
+      coalesce(sum(CASE WHEN state='manual_review' THEN 1 ELSE 0 END),0) AS manual_review,
+      coalesce(sum(CASE WHEN state='scheduled' AND (cycle_deadline_day<? OR (overflow=1 AND cycle_deadline_day<=?)) THEN 1 ELSE 0 END),0) AS overdue,
+      min(CASE WHEN state='scheduled' AND (cycle_deadline_day<? OR (overflow=1 AND cycle_deadline_day<=?)) THEN cycle_deadline_day END) AS earliest_overdue_at
+      FROM interaction_plans`).get(now,today,today,today,today);
+    const parsed=z.object({
+      pending:z.number(),due:z.number(),next_due_at:z.number().nullable(),scheduled:z.number(),waiting_template:z.number(),paused_channel:z.number(),claimed:z.number(),uncertain:z.number(),manual_review:z.number(),overdue:z.number(),earliest_overdue_at:z.number().nullable(),
+    }).parse(row);
+    return queueSummarySchema.parse({pending:parsed.pending,due:parsed.due,nextDueAt:parsed.next_due_at,scheduled:parsed.scheduled,waitingTemplate:parsed.waiting_template,pausedChannel:parsed.paused_channel,claimed:parsed.claimed,uncertain:parsed.uncertain,manualReview:parsed.manual_review,overdue:parsed.overdue,earliestOverdueAt:parsed.earliest_overdue_at});
   }
   legacyOwnershipPending() {
     return countRow.parse(this.db.prepare("SELECT count(*) AS n FROM interaction_plans WHERE owner_uid='unknown' AND snapshot_source='legacy_snapshot'").get()).n>0;
