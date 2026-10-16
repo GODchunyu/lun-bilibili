@@ -131,7 +131,7 @@ export class OpenAiPatrol implements PatrolAi {
     throw new AiLocalCheck(`判断原因含${hit}，按跳过处理`);
   }
   async write(topic: Topic, video: Video, keyword: string, candidates: OrdinaryComment[]): Promise<AiWriting> {
-    const result = writingSchema.safeParse(await this.request('现在才撰写一句温和短评，不超过120字，按可选风格，不添加事实。返回 {"text":"短评","rpid":0}；有候选评论时只能从候选中选择一条 rpid 并写针对它的回复。没有合适候选或拿不准时返回 {"text":"","rpid":0}，本地将跳过。不写链接、联系方式、广告。', { ...this.context(topic, video, keyword), style: topic.style, candidates: candidates.map(c => ({ rpid: c.rpid, content: c.content })) }));
+    const result = writingSchema.safeParse(await this.request('现在才撰写一句温和短评，不超过120字，不添加事实。返回 {"text":"短评","rpid":0}；有候选评论时只能从候选中选择一条 rpid 并写针对它的回复。没有合适候选或拿不准时返回 {"text":"","rpid":0}，本地将跳过。不写链接、联系方式、广告。', { ...this.context(topic, video, keyword), style: '', candidates: candidates.map(c => ({ rpid: c.rpid, content: c.content })) }));
     if (!result.success || !safeAiText(result.data.text) || (candidates.length ? !candidates.some(c => c.rpid === result.data.rpid) : result.data.rpid !== 0)) throw new AiFailure('AI 撰写未通过本地检查，已跳过');
     return result.data;
   }

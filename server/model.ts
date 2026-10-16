@@ -5,22 +5,26 @@ export const defaultMinPlay = 1000;
 export const topicSchema = z.object({
   name: z.string().trim().min(1).max(80),
   enabled: z.boolean().default(false),
-  aiJudgment: z.boolean().default(false),
-  writingMode: z.enum(['template', 'ai']).default('template'),
-  style: z.string().trim().max(300).default(''),
+  // Legacy fields remain parseable for old databases and API clients; patrol ignores their filtering/AI semantics.
+  aiJudgment: z.boolean().default(false), writingMode: z.enum(['template', 'ai']).default('template'), style: z.string().trim().max(300).default(''),
   keywords: z.array(z.string().trim().min(1).max(100)).min(1).max(30),
   intervalMin: minutes.default(30), intervalMax: minutes.default(90),
-  maxAgeHours: z.number().min(1).max(8760).default(72),
-  minPlay: z.number().int().min(0).nullable().default(null),
-  maxPlay: z.number().int().min(0).nullable().default(null),
+  maxAgeHours: z.number().min(1).max(8760).default(72), minPlay: z.number().int().min(0).nullable().default(null), maxPlay: z.number().int().min(0).nullable().default(null),
   dailySearch: quota.default(20), dailyComment: quota.default(5), dailyReply: quota.default(3),
   skipProbability: quota.default(70), commentProbability: quota.default(20), replyProbability: quota.default(10),
 }).superRefine((v, ctx) => {
   if (v.intervalMax < v.intervalMin) ctx.addIssue({ code: 'custom', message: '搜索间隔最大值不能小于最小值' });
   if (v.minPlay !== null && v.maxPlay !== null && v.maxPlay < v.minPlay) ctx.addIssue({ code: 'custom', message: '播放量最大值不能小于最小值' });
   if (v.skipProbability + v.commentProbability + v.replyProbability !== 100) ctx.addIssue({ code: 'custom', message: '互动概率之和必须为 100' });
+  for (const keyword of v.keywords) {
+    if (!normalizeKeywordText(keyword)) ctx.addIssue({ code: 'custom', path: ['keywords'], message: '关键词不能只包含空格或标点' });
+  }
 });
 export type TopicConfig = z.infer<typeof topicSchema>;
+/** Shared search normalization used for keyword validation and local matching. */
+export function normalizeKeywordText(value: string) {
+  return value.normalize('NFKC').toLocaleLowerCase('und').replace(/[\p{P}\p{Z}\s\p{Cf}]/gu, '');
+}
 export type Topic = TopicConfig & { id: number; nextSearch: number; lastRun: number | null; todayDiscovered: number; todayInteractions: number };
 export const templateSchema = z.object({ topicId: z.number().int().positive(), kind: z.enum(['comment', 'reply']), text: z.string().trim().min(1).max(300), enabled: z.boolean().default(true) });
 export type Template = z.infer<typeof templateSchema> & { id: number };
@@ -40,6 +44,42 @@ export const aiSettingsSchema = aiConfigSchema.omit({ apiKey: true }).extend({ a
 // failures/retryAt belong to queue execution; reads have an independent failure streak.
 export const settingsSchema = z.object({ limits: limitsSchema, running: z.boolean(), pauseReason: z.string(), failures: z.number(), retryAt: z.number(), readFailures: z.number().default(0), readRetryAt: z.number().default(0), nextInteraction: z.number(), lastContent: z.string(), account: accountSchema, ai: aiSettingsSchema.default({}) });
 export type Settings = z.infer<typeof settingsSchema>;
+/** Persistent interaction plan and attempt contracts.  These are deliberately
+ * independent from the legacy `interactions` queue table so retries never
+ * overwrite an earlier send attempt. */
+export const interactionActionSchema = z.enum(['comment', 'reply']);
+export type InteractionAction = z.infer<typeof interactionActionSchema>;
+export const interactionStateSchema = z.enum([
+  'scheduled', 'waiting_template', 'paused_channel', 'claimed',
+  'succeeded', 'uncertain', 'manual_review', 'cancelled',
+]);
+export type InteractionState = z.infer<typeof interactionStateSchema>;
+export const dispatchClassSchema = z.enum(['ordinary', 'overdue', 'legacy_unknown']);
+export type DispatchClass = z.infer<typeof dispatchClassSchema>;
+export const attemptStatusSchema = z.enum(['started', 'succeeded', 'failed', 'uncertain', 'manual_review']);
+export type AttemptStatus = z.infer<typeof attemptStatusSchema>;
+export const failureStageSchema = z.enum(['prepare', 'claim', 'send', 'receipt', 'recovery', 'unknown']);
+export type FailureStage = z.infer<typeof failureStageSchema>;
+export const interactionPlanSchema = z.object({
+  id: z.number().int().positive(), bvid: z.string(), aid: z.number().int().positive().optional(),
+  topicId: z.number().int().positive().nullable(), ownerUid: z.string().min(1),
+  topicName: z.string(), keyword: z.string(), matchedField: z.string().default(''), video: z.string(),
+  plannedAction: interactionActionSchema, commentTemplates: z.array(z.string()).default([]), replyTemplates: z.array(z.string()).default([]), snapshotSource: z.enum(['native','legacy_snapshot']).default('native'),
+  firstEnqueuedAt: z.number().int(), cycleStartDay: z.number().int(), cycleDeadlineDay: z.number().int(), dueAt: z.number().int(),
+  deferred: z.boolean().default(false), overflow: z.boolean(), cycleCount: z.number().int().nonnegative(), failureCount: z.number().int().nonnegative(),
+  state: interactionStateSchema, version: z.number().int().nonnegative(), nextPrepareAt: z.number().int().nullable(),
+  readDay: z.number().int().nullable(), readCount: z.number().int().nonnegative(), channelDisabled: z.boolean(), orphaned: z.boolean(), cancelRequested: z.boolean(), resumeState: interactionStateSchema.nullable().optional(),
+});
+export type InteractionPlan = z.infer<typeof interactionPlanSchema>;
+export const interactionAttemptSchema = z.object({
+  id: z.number().int().positive(), planId: z.number().int().positive(), attemptNo: z.number().int().positive(), operationId: z.string(),
+  quotaDay: z.number().int(), dispatchClass: dispatchClassSchema, billingTopicId: z.number().int().positive().nullable(), billingTopicName: z.string(), senderUid: z.string().min(1),
+  startedAt: z.number().int(), finishedAt: z.number().int().nullable(), effectiveAction: interactionActionSchema, fallbackReason: z.string(), content: z.string(), target: z.string(), targetId: z.number().int().nonnegative(), targetUid: z.string(),
+  status: attemptStatusSchema, failureStage: failureStageSchema, errorCode: z.string(), receipt: z.string(), requestUncertain: z.boolean(), requestInFlight: z.boolean().default(false),
+});
+export type InteractionAttempt = z.infer<typeof interactionAttemptSchema>;
+export const operationStatusSchema = z.object({ status: z.enum(['not_found','running','succeeded','confirmed_failure','uncertain','interrupted']), result: z.unknown().optional() });
+export type OperationStatus = z.infer<typeof operationStatusSchema>;
 export const videoSchema = z.object({ bvid: z.string().regex(/^BV[0-9A-Za-z]{10}$/), aid: z.number().int().positive(), title: z.string(), author: z.string(), play: z.number().nonnegative(), pubdate: z.number().positive() });
 export type Video = z.infer<typeof videoSchema>;
 export const commentSchema = z.object({ rpid: z.number().int().positive(), user: z.string(), content: z.string(), pinned: z.boolean(), ordinary: z.boolean(), uid: z.string().optional() });
@@ -60,13 +100,14 @@ export type RecentComment = z.infer<typeof recentCommentSchema>;
 export type SearchWindow = { publishedAfter: number; publishedBefore: number };
 export interface Bilibili {
   checkLogin(): Promise<Account>;
-  search(keyword: string, window: SearchWindow): Promise<Video[]>;
+  search(keyword: string): Promise<Video[]>;
   comments(bvid: string): Promise<OrdinaryComment[]>;
-  post(bvid: string, text: string, rpid?: number): Promise<PostReceipt | void>;
+  post(bvid: string, text: string, rpid?: number, operationId?: string): Promise<PostReceipt | void>;
+  operationStatus?(bvid: string, text: string, rpid: number, operationId: string): Promise<OperationStatus>;
 }
 export class BiliError extends Error {
-  constructor(public kind: 'risk' | 'auth' | 'api' | 'disabled') {
-    super({ risk: '验证码或风控：已停止互动', auth: '登录失效，请重新登录', api: 'Bilibili API 请求失败', disabled: '真实写操作未启用' }[kind]);
+  constructor(public kind: 'risk' | 'auth' | 'api' | 'disabled', public stage: 'prepare' | 'send' | 'receipt' | 'unknown' = 'unknown', public sendState: 'confirmed_not_sent' | 'uncertain' | 'not_applicable' = 'not_applicable', public errorCode = '', public legacyDetails?: unknown, displayMessage?: string) {
+    super(displayMessage ?? { risk: '验证码或风控：已停止互动', auth: '登录失效，请重新登录', api: 'Bilibili API 请求失败', disabled: '真实写操作未启用' }[kind]);
   }
 }
 export function dayStart(now: number) {

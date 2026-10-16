@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from datetime import datetime, timedelta
 import json
 import tempfile
@@ -39,7 +40,8 @@ class BridgeBehavior(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(value["status"], "done")
             self.assertIsNone(bridge.qr_session)
             self.assertEqual((bridge.next_renewal, bridge.renewal), (0.0, None))
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(path.read_text()), {"sessdata": "LOCAL_SESSDATA%2C1", "bili_jct": "LOCAL_JCT", "buvid3": "", "dedeuserid": "100", "ac_time_value": "LOCAL_REFRESH_TOKEN"})
             self.assertNotIn("LOCAL_", json.dumps(value))
 
@@ -189,7 +191,8 @@ class BridgeBehavior(unittest.IsolatedAsyncioTestCase):
             cred.sessdata, cred.bili_jct, cred.ac_time_value = "LOCAL_NEW_SESSDATA", "LOCAL_NEW_JCT", "LOCAL_NEW_TOKEN"
         result, info = await self.login_check(AsyncMock(return_value=True), refresh)
         self.assertEqual(json.loads(bridge.upstream.CRED_FILE.read_text()), {"sessdata": "LOCAL_NEW_SESSDATA", "bili_jct": "LOCAL_NEW_JCT", "buvid3": "LOCAL_BUVID", "dedeuserid": "100", "ac_time_value": "LOCAL_NEW_TOKEN"})
-        self.assertEqual(bridge.upstream.CRED_FILE.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":
+            self.assertEqual(bridge.upstream.CRED_FILE.stat().st_mode & 0o777, 0o600)
         self.assertEqual(info.await_args.args[0].sessdata, "LOCAL_NEW_SESSDATA")
         self.assertTrue(result["logged_in"])
         self.assertEqual(result["renewal"]["status"], "renewed")

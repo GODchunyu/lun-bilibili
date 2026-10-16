@@ -25,7 +25,7 @@ test('Cookie login is private, validates, pauses, supports expiration and logout
   try {
     const response = await app.inject({ method:'POST',url:'/api/account/cookie',payload:{ cookie } });
     assert.equal(response.statusCode,200); assert.equal(store.account().username,'测试账号'); assert.equal(response.body.includes(marker),false);
-    assert.equal((await stat(path)).mode & 0o777,0o600);
+    if (process.platform !== 'win32') assert.equal((await stat(path)).mode & 0o777,0o600);
     const saved = z.object({ sessdata:z.string() }).parse(JSON.parse(await readFile(path,'utf8')));
     assert.equal(saved.sessdata,`${marker}=encoded`);
     await scheduler.run(); assert.equal(store.settings().running,true);
@@ -41,7 +41,7 @@ test('Cookie login keeps an optional refresh token; a malformed token changes no
   const directory = await mkdtemp(join(tmpdir(),'yui-token-'));
   const path = join(directory,'config/bili_credential.json'); const store = new Store(':memory:'); let resets = 0;
   const bili: ApplicationBilibili = {
-    async checkLogin() { return { loggedIn:true,username:'测试账号',message:'已登录' }; }, async search() { throw new Error('Not used'); }, async comments() { throw new Error('Not used'); }, async post() { throw new Error('Not used'); }, async tools() { throw new Error('Not used'); }, async qrStart() { throw new Error('Not used'); }, async qrCheck() { throw new Error('Not used'); },
+    async checkLogin() { return { loggedIn:true,username:'测试账号',uid:'100',message:'已登录' }; }, async search() { throw new Error('Not used'); }, async comments() { throw new Error('Not used'); }, async post() { throw new Error('Not used'); }, async tools() { throw new Error('Not used'); }, async qrStart() { throw new Error('Not used'); }, async qrCheck() { throw new Error('Not used'); },
     async resetSession() { resets++; },
   };
   const scheduler = new Scheduler(store,bili); const app = await createApp(store,bili,scheduler,path,true);

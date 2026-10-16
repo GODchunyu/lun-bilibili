@@ -2,6 +2,8 @@
 import asyncio
 import base64
 import functools
+import hashlib
+import html
 import importlib.util
 import io
 import json
@@ -9,6 +11,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -30,6 +33,7 @@ RENEW_INTERVAL = 12 * 3600
 WRITES = {"bili_reply", "bili_send_dynamic", "bili_upload_video", "bili_upload_video_multi", "bili_send_opus", "bili_send_message"}
 TOOLS = ["bili_login", "bili_login_check", "bili_check_credential", "bili_search", "bili_comments", "bili_subtitle", "bili_danmaku", "bili_video_info", "bili_reply", "bili_crawl", "bili_send_dynamic", "bili_upload_video", "bili_upload_video_multi", "bili_send_opus", "bili_video_zones", "bili_hot_videos", "bili_hot_buzzwords", "bili_weekly_hot", "bili_rank", "bili_user_info", "bili_user_videos", "bili_favorite_lists", "bili_favorite_content", "bili_send_message", "bili_unread_messages", "bili_received_replies", "bili_received_at_and_likes"]
 lock = asyncio.Lock()
+active_operations = {}
 qr_session = None
 # Per bridge process: the first login check after start or a new login asks Bilibili, then every 12 hours.
 next_renewal = 0.0
@@ -120,7 +124,9 @@ async def bili_search(keyword: str, num: int = 10, order: str = "totalrank", pub
     data = await search.search_by_type(keyword=keyword, search_type=search.SearchObjectType.VIDEO, page=1, page_size=size, order_type=orders.get(order, search.OrderVideo.TOTALRANK), **dates)
     videos = []
     for item in data.get("result", [])[:size]:
-        videos.append({"bvid": item.get("bvid", ""), "aid": item.get("aid", 0), "title": item.get("title", "").replace('<em class="keyword">', '').replace('</em>', ''), "author": item.get("author", ""), "play": item.get("play", 0), "pubdate": item.get("pubdate", 0)})
+        title = html.unescape(re.sub(r"<[^>]*>", "", item.get("title", "")))
+        author = html.unescape(re.sub(r"<[^>]*>", "", item.get("author", "")))
+        videos.append({"bvid": item.get("bvid", ""), "aid": item.get("aid", 0), "title": re.sub(r"\s+", " ", title).strip(), "author": re.sub(r"\s+", " ", author).strip(), "play": item.get("play", 0), "pubdate": item.get("pubdate", 0)})
     return json.dumps({"videos": videos}, ensure_ascii=False)
 
 
@@ -162,7 +168,7 @@ def post_receipt(info, result):
     return {key: value for key, value in receipt.items() if value is not None}
 
 
-async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0) -> str:
+async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0, operation_id: str = "") -> str:
     """
     在B站视频下发表评论或回复某条评论
 
@@ -175,17 +181,132 @@ async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0) -> str:
     Returns:
         发表结果；成功时附新评论 rpid、视频封面和发送时播放数据
     """
-    # Same send calls as the pinned upstream; only the success payload gains the receipt.
-    cred = upstream.get_cred()
-    info = await video.Video(bvid=bvid, credential=cred).get_info()
+    if operation_id.startswith("lookup:"):
+        lookup_id = operation_id.removeprefix("lookup:")
+        try:
+            uuid.UUID(lookup_id)
+        except (ValueError, TypeError, AttributeError):
+            return json.dumps({"error_type":"api", "stage":"prepare", "send_state":"confirmed_not_sent", "error_code":"invalid_operation_id"}, ensure_ascii=False)
+        digest = hashlib.sha256(json.dumps([bvid, text, int(rpid), int(root)], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+        path = upstream.CRED_FILE.with_name("interaction_operations.json")
+        records = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(records, dict):
+            raise ValueError("operation journal format")
+        record = records.get(lookup_id)
+        if record is None:
+            return json.dumps({"status":"not_found"}, ensure_ascii=False)
+        if record.get("payload_hash") != digest:
+            return json.dumps({"error_type":"api", "stage":"prepare", "send_state":"confirmed_not_sent", "error_code":"operation_id_conflict"}, ensure_ascii=False)
+        state = record.get("state")
+        if state == "succeeded":
+            return json.dumps({"status":"succeeded", "result":record.get("result")}, ensure_ascii=False)
+        if state == "confirmed_failure":
+            return json.dumps({"status":"confirmed_failure", "result":record.get("result")}, ensure_ascii=False)
+        if state == "uncertain":
+            return json.dumps({"status":"uncertain", "result":record.get("result")}, ensure_ascii=False)
+        if state == "started":
+            task = active_operations.get(lookup_id)
+            owner_pid = record.get("bridge_pid")
+            owner_alive = False
+            if isinstance(owner_pid, int) and owner_pid != os.getpid():
+                try:
+                    os.kill(owner_pid, 0)
+                    owner_alive = True
+                except ProcessLookupError:
+                    owner_alive = False
+                except (PermissionError, OSError):
+                    # Unknown process state is treated as alive; never turn uncertainty into a retry.
+                    owner_alive = True
+            if task is not None and not task.done() or owner_alive:
+                return json.dumps({"status":"running"}, ensure_ascii=False)
+            return json.dumps({"status":"interrupted"}, ensure_ascii=False)
+        return json.dumps({"status":"uncertain"}, ensure_ascii=False)
+    if not operation_id:
+        # Direct/manual MCP callers keep the original tool contract. The patrol scheduler
+        # always supplies an operation id and uses the durable journal path below.
+        try:
+            cred = upstream.get_cred()
+            info = await video.Video(bvid=bvid, credential=cred).get_info()
+            if rpid == 0:
+                sent = await comment.send_comment(text=text, oid=info["aid"], type_=comment.CommentResourceType.VIDEO, credential=cred)
+            else:
+                sent = await comment.send_comment(text=text, oid=info["aid"], type_=comment.CommentResourceType.VIDEO, root=root if root != 0 else rpid, parent=rpid, credential=cred)
+            return json.dumps({"success":True,"message":"评论发送成功",**post_receipt(info,sent)}, ensure_ascii=False)
+        except Exception as error:
+            return json.dumps({"success":False,"error":str(error)}, ensure_ascii=False)
     try:
-        if rpid == 0:
-            result = await comment.send_comment(text=text, oid=info["aid"], type_=comment.CommentResourceType.VIDEO, credential=cred)
-        else:
-            result = await comment.send_comment(text=text, oid=info["aid"], type_=comment.CommentResourceType.VIDEO, root=root if root != 0 else rpid, parent=rpid, credential=cred)
-    except Exception as error:
-        return json.dumps({"success": False, "error": str(error)}, ensure_ascii=False)
-    return json.dumps({"success": True, "message": "评论发送成功", **post_receipt(info, result)}, ensure_ascii=False)
+        uuid.UUID(operation_id)
+    except (ValueError, TypeError, AttributeError):
+        return json.dumps({"success": False, "error_type":"api", "stage":"prepare", "send_state":"confirmed_not_sent", "error_code":"invalid_operation_id"}, ensure_ascii=False)
+    digest = hashlib.sha256(json.dumps([bvid, text, int(rpid), int(root)], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+    path = upstream.CRED_FILE.with_name("interaction_operations.json")
+
+    def read_journal():
+        if not path.exists():
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("operation journal format")
+        return value
+
+    def save_record(record):
+        records = read_journal()
+        records[operation_id] = {**record, "bridge_pid": os.getpid()}
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = path.with_suffix(".tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(records, file, ensure_ascii=False, separators=(",", ":"))
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+        path.chmod(0o600)
+
+    previous = read_journal().get(operation_id)
+    if previous:
+        if previous.get("payload_hash") != digest:
+            return json.dumps({"success": False, "error_type":"api", "stage":"prepare", "send_state":"confirmed_not_sent", "error_code":"operation_id_conflict"}, ensure_ascii=False)
+        if previous.get("state") == "succeeded":
+            return json.dumps(previous.get("result") or {"success": True}, ensure_ascii=False)
+        if previous.get("state") == "confirmed_failure":
+            return json.dumps(previous.get("result") or {"success": False, "send_state":"confirmed_not_sent"}, ensure_ascii=False)
+        # A journal entry left at started is intentionally never submitted again.
+        return json.dumps({"success": False, "error_type":"api", "stage":"send", "send_state":"uncertain", "error_code":"operation_still_running" if operation_id in active_operations and not active_operations[operation_id].done() else "operation_interrupted"}, ensure_ascii=False)
+
+    # Persist intent before invoking the platform. A crash can only produce an uncertain, non-replayed operation.
+    save_record({"payload_hash": digest, "state":"started", "result":None})
+
+    async def execute_once():
+        try:
+            cred = upstream.get_cred()
+            info = await video.Video(bvid=bvid, credential=cred).get_info()
+        except Exception as error:
+            result = {"success":False, "error_type":error_kind(error), "stage":"prepare", "send_state":"confirmed_not_sent", "error_code":"prepare_failed"}
+            save_record({"payload_hash":digest,"state":"confirmed_failure","result":result})
+            return result
+        try:
+            if rpid == 0:
+                sent = await comment.send_comment(text=text, oid=info["aid"], type_=comment.CommentResourceType.VIDEO, credential=cred)
+            else:
+                sent = await comment.send_comment(text=text, oid=info["aid"], type_=comment.CommentResourceType.VIDEO, root=root if root != 0 else rpid, parent=rpid, credential=cred)
+        except Exception as error:
+            # Unless the SDK returned a durable success payload, submission cannot be ruled out.
+            result = {"success":False, "error_type":error_kind(error), "stage":"send", "send_state":"uncertain", "error_code":"send_result_unknown"}
+            save_record({"payload_hash":digest,"state":"uncertain","result":result})
+            return result
+        result = {"success":True, "message":"评论发送成功", **post_receipt(info, sent)}
+        save_record({"payload_hash":digest,"state":"succeeded","result":result})
+        return result
+
+    task = asyncio.create_task(execute_once())
+    active_operations[operation_id] = task
+    task.add_done_callback(lambda _task: active_operations.pop(operation_id, None))
+    try:
+        result = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # The shielded operation keeps running and persists its eventual receipt for an idempotent poll.
+        result = {"success":False, "error_type":"api", "stage":"send", "send_state":"uncertain", "error_code":"client_disconnected"}
+    return json.dumps(result, ensure_ascii=False)
 
 
 async def qr_request(name, **params):
@@ -269,15 +390,20 @@ def guarded(name, function):
     async def invoke(*args, **kwargs):
         async with lock:
             try:
-                if name in WRITES and os.environ.get("BILIBILI_WRITES_ENABLED") != "true":
-                    return json.dumps({"error_type": "disabled", "error": "真实写操作未启用"}, ensure_ascii=False)
+                lookup = name == "bili_reply" and str(kwargs.get("operation_id", "")).startswith("lookup:")
+                if name in WRITES and not lookup and os.environ.get("BILIBILI_WRITES_ENABLED") != "true":
+                    return json.dumps({"error_type": "disabled", "error": "真实写操作未启用", "stage":"prepare", "send_state":"confirmed_not_sent", "error_code":"writes_disabled"}, ensure_ascii=False)
                 result = json.loads(await function(*args, **kwargs))
                 if isinstance(result, dict) and ("error" in result or result.get("success") is False or "at_error" in result or "likes_error" in result):
-                    return json.dumps({"error_type": error_kind(result), "error": "Bilibili 请求失败"}, ensure_ascii=False)
+                    send_state = result.get("send_state") if name in WRITES else "not_applicable"
+                    kind=result.get("error_type") if result.get("error_type") in ("risk","auth","api","disabled") else error_kind(result)
+                    stage=result.get("stage") if result.get("stage") in ("prepare","send","receipt","unknown") else ("send" if name in WRITES else "unknown")
+                    code=result.get("error_code") if isinstance(result.get("error_code"),str) else "platform_error"
+                    return json.dumps({"error_type": kind, "stage":stage, "send_state":send_state or "uncertain", "error_code":code}, ensure_ascii=False)
                 return json.dumps(scrub(result), ensure_ascii=False)
             except Exception as error:
                 # No exception text, arguments or credentials cross the MCP boundary.
-                return json.dumps({"error_type": error_kind(error), "error": "Bilibili 请求失败"}, ensure_ascii=False)
+                return json.dumps({"error_type": error_kind(error), "stage":"send" if name in WRITES else "unknown", "send_state":"uncertain" if name in WRITES else "not_applicable", "error_code":"bridge_exception"}, ensure_ascii=False)
     return invoke
 
 

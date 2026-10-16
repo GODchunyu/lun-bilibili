@@ -1,3 +1,5 @@
+> 本文保留旧版 AI/热度行为的兼容说明。当前自动巡逻以 `docs/开发计划.md` 与 `docs/开发约束.md` 为准：只匹配视频标题；不使用发布时间、播放量或简介过滤；固定 70% 延后、20% 评论、10% 回复；计划、尝试和桥接 operation journal 持久化。
+
 # 详细行为与边界
 
 本页描述当前实现；安装和首次使用见 [README](../README.md)。安全默认值与限额不能保证账号安全，也不替代平台规则。
@@ -5,15 +7,15 @@
 ## 调度、额度与去重
 
 ```text
-关键词轮询 → 日期限定播放量排序搜索 → 精确时间 / 播放量过滤 → 全局 BV / AV 去重
-  → 概率分支或一次 AI 判断 → 持久化互动队列 → 随机等待
-  → 抽模板或 AI 撰写 → 当前状态复核 → 持久化 claim → 发送 → 记录结果
+- 搜索排序仍使用平台播放量排序，但发布时间、播放量和简介不参与资格过滤。
+  → 固定 70% 延后 / 20% 评论 / 10% 回复 → 持久化互动计划 → 随机等待
+  → 从入池模板快照选正文 → 当前状态复核 → 持久化 claim → 发送 → 记录结果
 ```
 
 Discovery 与 Interaction Queue 分开存储，删除频道不会删除全局发现记录。
 
-- 默认每频道搜索 30–90 分钟一次、最近 72 小时、最低播放量留空按 1000 执行；每日搜索 20 / 评论 5 / 回复 3；跳过 / 评论 / 回复概率 70 / 20 / 10。
-- 搜索固定为「播放量降序（click）+ 原生日期筛选」第一页最多 50 条，再由本地按精确时间窗与播放量上下限过滤；资格在发现前、AI 入队后、队列执行与发送前按最新配置复核。被热度过滤的视频不写发现记录、不占去重。
+- 默认每频道搜索 30–90 分钟一次；每日搜索 20 / 评论 5 / 回复 3；新匹配固定按延后 / 评论 / 回复 70 / 20 / 10 分流。
+- 搜索固定使用播放量排序的第一页（最多 50 条）；不传发布时间限制，也不按发布时间、播放量或简介过滤。
 - 全局每日搜索 200 / 评论 10 / 回复 5 / 总互动 15；两次互动等待 5–30 分钟。
 - 全局和频道额度同时生效，日界固定为 **Asia/Shanghai**，不依赖宿主机时区。发送额度按尝试计数，失败也占额度。
 - 所有异步准备完成后复核最新运行状态；claim 前再检查登录、频道、限额、最短间隔、模板和 AI 模式。调高等待下限后，尚未 claim 的队列继续等待，不提前占额度。
@@ -125,3 +127,12 @@ Agent 使用 `bridge/server.py`，不要运行 vendored 原始入口或登录脚
 `bili_login`、`bili_login_check`、`bili_check_credential`、`bili_search`、`bili_comments`、`bili_subtitle`、`bili_danmaku`、`bili_video_info`、`bili_reply`、`bili_crawl`、`bili_send_dynamic`、`bili_upload_video`、`bili_upload_video_multi`、`bili_send_opus`、`bili_video_zones`、`bili_hot_videos`、`bili_hot_buzzwords`、`bili_weekly_hot`、`bili_rank`、`bili_user_info`、`bili_user_videos`、`bili_favorite_lists`、`bili_favorite_content`、`bili_send_message`、`bili_unread_messages`、`bili_received_replies`、`bili_received_at_and_likes`。
 
 自动队列仅使用 `bili_check_credential`、`bili_search`、`bili_comments`、`bili_reply`。其他工具用于手动 Agent；**手动调用不经过巡逻额度和队列**，所有写工具仍受桥接写开关约束。不要把启用真实写操作的 MCP 服务交给不可信 Agent。
+
+
+## 模板文字复用（2026-10-15）
+
+计划从入池时保存的模板快照中选择正文，不再排除与 `lastContent` 相同的候选。不同视频可使用同一文字，评论和回复可共享文字；只剩空模板或空白文字时，任务进入 `waiting_template`，事件原因为“没有可用模板”。`lastContent` 为兼容旧设置继续保存，但不参与发送放行判断。视频去重、发送前 claim、额度和互动间隔继续生效。
+
+启动先持久化暂停状态，再以迁移版本 2 恢复旧规则阻塞的有效快照：最近一条 `template_wait` 原因为“没有可用且不重复的模板”，账号已绑定且归属一致，频道仍存在，计划未取消或孤立，且无已成功、在途、结果不确定或人工核查的发送尝试。评论和回复快照均通过非空文本校验后才恢复；损坏或缺失的快照仍需人工修复。
+
+恢复只改变计划状态、必要的频道恢复状态和版本号，并追加 `template_repeat_recovered` 事件；原日期、周期、动作、快照、失败历史及 `next_prepare_at` 不变。频道暂停的计划仍保持 `paused_channel`，只将 `resume_state` 改为 `scheduled`。更新、事件与迁移标记在同一事务内提交，重复启动不再次恢复。迁移本身不发网络请求。

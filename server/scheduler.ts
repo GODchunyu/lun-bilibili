@@ -1,273 +1,197 @@
-import { z } from 'zod';
+import { BiliError, dayStart, safeComment, videoSchema } from './model.js';
+import type { Account, Bilibili, Topic, TopicConfig, Video, Activity, OrdinaryComment, InteractionAction } from './model.js';
+import { keywordMatchesTitle, normalizeSearchText } from './bilibili.js';
 import { Store, STARTUP_PAUSE } from './store.js';
-import { BiliError, dayStart, defaultMinPlay, safeComment, videoSchema } from './model.js';
-import type { Bilibili, Topic, TopicConfig, Video, Activity, Template, OrdinaryComment } from './model.js';
-import { AiConfigError, AiFailure, AiLocalCheck, OpenAiPatrol, aiReplyCandidate, safeAiText } from './ai.js';
-import type { PatrolAi } from './ai.js';
-function eligible(video: Video, topic: TopicConfig, now: number) {
-  const published = video.pubdate * 1000;
-  return published <= now && published >= now - topic.maxAgeHours * 3600000
-    && video.play >= (topic.minPlay ?? defaultMinPlay) && (topic.maxPlay === null || video.play <= topic.maxPlay);
-}
+
 export class Scheduler {
   private active?: Promise<void>;
   private timer?: NodeJS.Timeout;
-  private generation = 0;
-  private nextLoginCheck = 0;
-  private nextIdleCheck = 0;
-  constructor(readonly store: Store, private bili: Bilibili, private clock = Date.now, private random = Math.random, private ai: PatrolAi = new OpenAiPatrol(() => store.aiConfig())) {}
-  startTimer() { this.timer = setInterval(() => { void this.tick(); }, 1000); }
-  async pause(reason = '手动暂停') {
+  private generation=0;
+  private nextLoginCheck=0;
+  private nextIdleCheck=0;
+
+  constructor(readonly store:Store, private bili:Bilibili, private clock=Date.now, private random=Math.random, _legacyAi?:unknown) {}
+  startTimer(){this.timer=setInterval(()=>void this.tick(),1000);}
+  async pause(reason='手动暂停'){
     this.generation++;
-    const s = this.store.settings(); s.running = false; s.pauseReason = reason; this.store.saveSettings(s);
+    const settings=this.store.settings();settings.running=false;settings.pauseReason=reason;this.store.saveSettings(settings);
     await this.active;
   }
-  async run() {
-    await this.pause();
-    const generation = this.generation;
-    this.checkAiConfiguration();
-    const account = await this.bili.checkLogin();
-    if (generation !== this.generation) return;
-    this.checkAiConfiguration();
-    const s = this.store.settings(); s.account = account;
-    if (!account.loggedIn) { s.pauseReason = '未登录，不能运行'; this.store.saveSettings(s); throw new BiliError('auth'); }
-    s.running = true; s.pauseReason = ''; s.failures = 0; s.retryAt = 0; s.readFailures = 0; s.readRetryAt = 0;
-    this.nextLoginCheck = this.clock() + 300000;
-    this.store.saveSettings(s);
+  async run(){
+    await this.pause();const generation=this.generation;const account=await this.bili.checkLogin();
+    if(generation!==this.generation)return;
+    const settings=this.store.settings();settings.account=account;this.store.saveSettings(settings);
+    if(!account.loggedIn||!account.uid)throw new BiliError('auth');
+    const binding=this.store.accountBinding();
+    if(!binding){const result=this.store.bindAccount(account.uid,true);if(!result.ok){settings.pauseReason=result.reason;this.store.saveSettings(settings);throw new BiliError('auth','unknown','not_applicable','account_binding_required',undefined,result.reason);}}
+    else if(!binding.verified||binding.uid!==account.uid){settings.pauseReason='账号 UID 与数据库绑定不一致，请人工确认';this.store.saveSettings(settings);throw new BiliError('auth','unknown','not_applicable','account_uid_mismatch',undefined,settings.pauseReason);}
+    settings.running=true;settings.pauseReason='';settings.failures=0;settings.retryAt=0;settings.readFailures=0;settings.readRetryAt=0;
+    this.nextLoginCheck=this.clock()+300000;this.store.saveSettings(settings);
   }
-  tick(): Promise<void> {
-    if (this.active) return this.active;
-    this.active = this.cycle().finally(() => { this.active = undefined; });
-    return this.active;
+  tick(){if(this.active)return this.active;this.active=this.cycle().finally(()=>{this.active=undefined;});return this.active;}
+  saveTopic(config:TopicConfig,id?:number){
+    if(config.enabled&&!id)throw new Error('新频道请先保存为停用状态，添加评论和回复模板后再启用');
+    if(config.enabled&&id){const current=this.store.templates().filter(t=>t.topicId===id&&t.enabled);if(!current.some(t=>t.kind==='comment')||!current.some(t=>t.kind==='reply'))throw new Error('启用频道前需要至少一个评论模板和一个回复模板');}
+    return this.store.saveTopic(config,id);
   }
-  private checkAiConfiguration() {
-    if (!this.store.topics().some(t => t.aiJudgment)) return;
-    try { this.ai.assertConfigured(); }
-    catch (error) {
-      const reason = error instanceof AiConfigError ? error.message : 'AI 配置无效';
-      const s = this.store.settings(); s.running = false; s.pauseReason = reason; this.store.saveSettings(s);
-      this.generation++;
-      throw new AiConfigError(reason);
+  private live(generation:number){return generation===this.generation&&this.store.settings().running;}
+  private wait(min:number,max:number){return Math.round((min+this.random()*Math.max(0,max-min))*60000);}
+  private log(topic:Topic|undefined,action:string,result:string,details:Partial<Activity>={}){
+    this.store.log({time:this.clock(),topicId:topic?.id??null,topic:topic?.name??'系统',keyword:'',bvid:'',title:'',author:'',action,content:'',target:'',result,error:'',...details});
+  }
+  private fail(error:unknown,topic?:Topic,details:Partial<Activity>={},channel:'read'|'interaction'='read'){
+    const failure=error instanceof BiliError?error:new BiliError('api');const settings=this.store.settings();
+    if(channel==='interaction')settings.failures++;else settings.readFailures++;
+    const count=channel==='interaction'?settings.failures:settings.readFailures;const retryAt=this.clock()+Math.min(3600000,60000*2**Math.min(count-1,6));
+    if(channel==='interaction')settings.retryAt=retryAt;else settings.readRetryAt=retryAt;
+    if(failure.kind==='risk'||failure.kind==='auth'||failure.kind==='disabled'||count>=settings.limits.failureLimit){settings.running=false;settings.pauseReason=failure.message;this.generation++;}
+    if(failure.kind==='auth')settings.account={loggedIn:false,message:failure.message};
+    this.store.saveSettings(settings);this.log(topic,'error','失败',{...details,error:failure.message});
+  }
+  private async idleLoginCheck(){
+    if(this.clock()<this.nextIdleCheck)return;this.nextIdleCheck=this.clock()+12*3600000;
+    try{const account=await this.bili.checkLogin();const settings=this.store.settings();if(settings.running)return;settings.account=account;
+      const binding=this.store.accountBinding();if(account.loggedIn&&account.uid&&binding&&binding.uid!==account.uid)settings.pauseReason='账号 UID 与数据库绑定不一致，请人工确认';
+      else if(account.loggedIn&&settings.pauseReason===STARTUP_PAUSE)settings.pauseReason='启动后暂停；登录有效，可手动启动巡逻';
+      this.store.saveSettings(settings);
+    }catch{this.nextIdleCheck=this.clock()+5*60000;}
+  }
+  private async cycle(){
+    const initial=this.store.settings();if(!initial.running)return this.idleLoginCheck();const generation=this.generation;
+    try{
+      const now=this.clock();const readBackoff=now<initial.readRetryAt;
+      const topics=this.store.topics(now);const dueSearch=!readBackoff&&topics.some(t=>t.enabled&&t.nextSearch<=now);
+      const duePlan=this.store.dueInteractionPlans(now,1).length>0;const dueUncertain=this.store.dueUncertainInteractionPlans(now,1).length>0;
+      if(!dueSearch&&!duePlan&&!dueUncertain&&now<this.nextLoginCheck)return;
+      const account=await this.bili.checkLogin();if(!this.live(generation))return;
+      if(!account.loggedIn||!account.uid)throw new BiliError('auth');
+      const current=this.store.settings();current.account=account;this.store.saveSettings(current);
+      const binding=this.store.accountBinding();if(!binding||!binding.verified||binding.uid!==account.uid)throw new BiliError('auth');
+      this.nextLoginCheck=now+300000;
+      if(!readBackoff)for(const topic of topics){if(!this.live(generation)||!topic.enabled||topic.nextSearch>now)continue;await this.discover(topic,generation);if(this.store.settings().readRetryAt>this.clock())break;}
+      if(this.live(generation))await this.interact(generation);
+    }catch(error){this.fail(error);}
+  }
+  private async discover(topic:Topic,generation:number){
+    const now=this.clock();const settings=this.store.settings();
+    if(this.store.count('search',now,topic.id)>=topic.dailySearch||this.store.count('search',now)>=settings.limits.dailySearch){this.store.db.prepare('UPDATE topics SET next_search=? WHERE id=?').run(dayStart(now)+86400000,topic.id);return;}
+    const keywords=[...new Map(topic.keywords.map(value=>[normalizeSearchText(value),value])).values()];
+    const searchedKeyword=keywords[this.store.count('search',now,topic.id)%keywords.length];
+    this.store.db.prepare('UPDATE topics SET next_search=?,last_run=? WHERE id=?').run(now+this.wait(topic.intervalMin,topic.intervalMax),now,topic.id);
+    let videos:Video[];try{videos=await this.bili.search(searchedKeyword);}catch(error){this.fail(error,topic,{keyword:searchedKeyword});return;}
+    if(!this.live(generation))return;const recovered=this.store.settings();recovered.readFailures=0;recovered.readRetryAt=0;this.store.saveSettings(recovered);
+    let matched=0,duplicates=0,created=0;
+    for(const video of videos){
+      if(!this.live(generation))return;const latest=this.store.topic(topic.id);if(!latest?.enabled)return;
+      const matchedKeyword=topic.keywords.find(value=>keywordMatchesTitle(value,video.title));if(!matchedKeyword)continue;matched++;
+      if(this.store.db.prepare('SELECT bvid FROM discoveries WHERE bvid=? OR aid=?').get(video.bvid,video.aid)){duplicates++;continue;}
+      const templates=this.store.templates().filter(t=>t.topicId===topic.id&&t.enabled);const comments=templates.filter(t=>t.kind==='comment').map(t=>t.text);const replies=templates.filter(t=>t.kind==='reply').map(t=>t.text);
+      if(!comments.length||!replies.length){this.log(latest,'error','缺少评论或回复模板，未入池',{keyword:matchedKeyword,bvid:video.bvid,title:video.title,author:video.author});continue;}
+      const roll=this.random()*100;const deferred=roll<70;const action:InteractionAction=deferred?(this.random()<.8?'comment':'reply'):roll<90?'comment':'reply';
+      const matchedField='title';
+      const plan=this.store.createInteractionPlan({video,topicId:topic.id,ownerUid:this.store.account().uid!,topicName:topic.name,keyword:matchedKeyword,matchedField,plannedAction:action,commentTemplates:comments,replyTemplates:replies,createdAt:now,dueAt:now+this.wait(settings.limits.waitMin,settings.limits.waitMax),cycleStartDay:dayStart(now),cycleDeadlineDay:dayStart(now)+30*86400000,overflow:false,deferred});
+      if(plan){created++;this.log(latest,'queue','已建立互动计划',{keyword:matchedKeyword,bvid:video.bvid,title:video.title,author:video.author,content:action});}else duplicates++;
     }
+    this.log(topic,'search','搜索完成',{keyword:searchedKeyword,content:`返回 ${videos.length} 条，匹配 ${matched} 条，重复 ${duplicates} 条，新增计划 ${created} 条`});
   }
-  saveTopic(config: TopicConfig, id?: number): number {
-    // A rejected save must not persist a hidden channel, change enablement or invalidate its queue.
-    if (config.aiJudgment) {
-      try { this.ai.assertConfigured(); }
-      catch (error) { throw error instanceof AiConfigError ? error : new AiConfigError('AI 配置无效'); }
-    }
-    return this.store.saveTopic(config, id);
+  private dispatchClass(plan:{cycleDeadlineDay:number;overflow:boolean},now:number):'ordinary'|'overdue'{
+    const today=dayStart(now);return today>plan.cycleDeadlineDay||(plan.overflow&&today>=plan.cycleDeadlineDay)?'overdue':'ordinary';
   }
-  private topicAiError(topic: Topic): AiConfigError | undefined {
-    if (!topic.aiJudgment) return;
-    try { this.ai.assertConfigured(); }
-    catch (error) {
-      const reason = error instanceof AiConfigError ? error.message : 'AI 配置无效';
-      this.store.saveTopic({ ...topic, enabled: false }, topic.id);
-      this.store.db.prepare("UPDATE interactions SET state='skipped' WHERE topic_id=? AND state='queued'").run(topic.id);
-      this.log(topic, 'error', 'AI 配置无效，频道已暂停', { error: reason });
-      return new AiConfigError(`${reason}；频道已暂停`);
-    }
-  }
-  private live(generation: number) { return generation === this.generation && this.store.settings().running; }
-  private wait(min: number, max: number) { return Math.round((min + this.random() * (max - min)) * 60000); }
-  private log(topic: Topic | undefined, action: string, result: string, details: Partial<Activity> = {}) {
-    this.store.log({ time: this.clock(), topicId: topic?.id ?? null, topic: topic?.name ?? '系统', keyword: '', bvid: '', title: '', author: '', action, content: '', target: '', result, error: '', ...details });
-  }
-  private fail(error: unknown, topic?: Topic, details: Partial<Activity> = {}, channel: 'read'|'interaction' = 'read') {
-    const failure = error instanceof BiliError ? error : new BiliError('api');
-    const s = this.store.settings();
-    const failures = channel === 'interaction' ? ++s.failures : ++s.readFailures;
-    const retryAt = this.clock() + Math.min(3600000, 60000 * 2 ** Math.min(failures - 1, 6));
-    if (channel === 'interaction') s.retryAt = retryAt; else s.readRetryAt = retryAt;
-    if (failure.kind === 'risk' || failure.kind === 'auth' || failure.kind === 'disabled' || failures >= s.limits.failureLimit) {
-      s.running = false;
-      s.pauseReason = failure.kind === 'api' ? '连续失败，已自动暂停' : failure.message;
-      if (failure.kind === 'auth') s.account = { loggedIn: false, message: failure.message };
-      this.generation++;
-    }
-    this.store.saveSettings(s);
-    this.log(topic,'error','失败',{ ...details, error: failure.message });
-  }
-  // Paused: verify login at startup and every 12 hours (5 minutes after a failed check), which also gives the
-  // bridge a chance to renew cookies.
-  private async idleLoginCheck() {
-    if (this.clock() < this.nextIdleCheck) return;
-    this.nextIdleCheck = this.clock() + 12 * 3600000;
-    const generation = this.generation;
-    try {
-      const account = await this.bili.checkLogin();
-      if (generation !== this.generation) return;
-      const s = this.store.settings();
-      if (s.running) return;
-      s.account = account;
-      if (account.loggedIn && s.pauseReason === STARTUP_PAUSE) s.pauseReason = '启动后暂停；登录有效，可手动启动巡逻';
-      this.store.saveSettings(s);
-    } catch { this.nextIdleCheck = this.clock() + 5 * 60000; }
-  }
-  private async cycle() {
-    const initial = this.store.settings();
-    if (!initial.running) return this.idleLoginCheck();
-    const generation = this.generation;
-    try {
-      const topics = this.store.topics(this.clock());
-      // Validate local configuration even on idle/backoff ticks, without pausing unrelated channels.
-      for (const topic of topics) if (topic.enabled && this.topicAiError(topic)) topic.enabled = false;
-      if (this.clock() < initial.readRetryAt) return;
-      const dueSearch = topics.some(t => t.enabled && t.nextSearch <= this.clock());
-      const dueInteraction = this.clock() >= initial.retryAt && this.clock() >= initial.nextInteraction && !!this.store.nextQueue(this.clock());
-      if (!dueSearch && !dueInteraction && this.clock() < this.nextLoginCheck) return;
-      const account = await this.bili.checkLogin();
-      this.nextLoginCheck = this.clock() + 300000;
-      if (!this.live(generation)) return;
-      const current = this.store.settings(); current.account = account; this.store.saveSettings(current);
-      if (!account.loggedIn) throw new BiliError('auth');
-      for (const topic of topics) {
-        if (!this.live(generation)) return;
-        if (!topic.enabled || topic.nextSearch > this.clock()) continue;
-        await this.discover(topic, generation);
-        if (this.store.settings().readRetryAt > this.clock()) return;
-      }
-      if (this.live(generation)) await this.interact(generation);
-    } catch (error) {
-      if (error instanceof AiConfigError) this.log(undefined, 'error', '启动配置无效', { error: error.message });
-      else this.fail(error);
-    }
-  }
-  private async discover(topic: Topic, generation: number) {
-    const now = this.clock();
-    const limits = this.store.settings().limits;
-    if (this.store.count('search',now,topic.id) >= topic.dailySearch || this.store.count('search',now) >= limits.dailySearch) {
-      this.store.db.prepare('UPDATE topics SET next_search=? WHERE id=?').run(dayStart(now) + 86400000,topic.id); return;
-    }
-    const keyword = topic.keywords[this.store.count('search',now,topic.id) % topic.keywords.length];
-    this.store.db.prepare('UPDATE topics SET next_search=?,last_run=? WHERE id=?').run(now + this.wait(topic.intervalMin,topic.intervalMax),now,topic.id);
-    this.log(topic,'search','已请求',{ keyword });
-    let videos: Video[];
-    try { videos = await this.bili.search(keyword, { publishedAfter: Math.floor((now - topic.maxAgeHours * 3600000) / 1000), publishedBefore: Math.floor(now / 1000) }); }
-    catch (error) { this.fail(error,topic,{ keyword }); return; }
-    if (!this.live(generation)) return;
-    const successful = this.store.settings(); successful.readFailures = 0; successful.readRetryAt = 0; this.store.saveSettings(successful);
-    // Configuration may change while a network call is in progress.
-    for (const video of videos) {
-      if (!this.live(generation)) return;
-      const currentTopic = this.store.topic(topic.id);
-      if (!currentTopic?.enabled || this.topicAiError(currentTopic)) return;
-      if (!eligible(video, currentTopic, this.clock())) continue;
-      if (!this.store.discover(video,topic.id,keyword,now)) continue;
-      const details = { keyword, bvid: video.bvid, title: video.title, author: video.author };
-      this.log(currentTopic,'discover','已发现',details);
-      if (currentTopic.aiJudgment) {
-        try {
-          const decision = await this.ai.judge(currentTopic, video, keyword);
-          const latestTopic = this.store.topic(topic.id);
-          if (!this.live(generation) || !latestTopic?.enabled || this.topicAiError(latestTopic)) return;
-          this.log(currentTopic, 'judge', `AI 判断：${{ skip: '跳过', comment: '评视频', reply: '回评论' }[decision.action]}`, { ...details, content: decision.reason });
-          if (decision.action === 'skip') this.log(currentTopic, 'skip', 'AI 判断跳过', { ...details, content: decision.reason });
-          else if (latestTopic.aiJudgment && eligible(video, latestTopic, this.clock())) {
-            this.store.queue(video.bvid, topic.id, decision.action, this.clock() + this.wait(limits.waitMin, limits.waitMax));
-            this.log(currentTopic, 'queue', '等待互动', { ...details, content: decision.action === 'comment' ? '视频评论' : '回复普通评论' });
-          }
-        } catch (error) {
-          this.log(currentTopic, 'judge', 'AI 判断：跳过', { ...details, content: error instanceof AiFailure ? error.message : '模型调用失败，已跳过' });
-          this.log(currentTopic, 'skip', error instanceof AiLocalCheck ? 'AI 判断原因未通过本地检查，已跳过' : 'AI 判断失败，已跳过', details);
+  private async pollUncertain(generation:number){
+    const plans=this.store.dueUncertainInteractionPlans(this.clock(),10);
+    for(const plan of plans){
+      if(!this.live(generation))return;
+      const attempt=this.store.latestInteractionAttempt(plan.id);
+      if(!attempt){this.store.deferUncertainPoll(plan.id,this.clock());continue;}
+      try{
+        if(!this.bili.operationStatus){this.store.deferUncertainPoll(plan.id,this.clock());continue;}
+        const status=await this.bili.operationStatus(plan.bvid,attempt.content,attempt.targetId,attempt.operationId);
+        if(status.status==='running'){
+          this.store.markRequestInFlight(attempt.id,true,this.clock(),'桥接报告原写请求仍在运行');
+          this.store.deferUncertainPoll(plan.id,this.clock());
+          return;
         }
+        if(status.status==='succeeded'){
+          this.store.recordLateReceipt(attempt.id,JSON.stringify(status.result??{}),this.clock(),'幂等操作账本返回原发送成功回执');
+          continue;
+        }
+        if(status.status==='confirmed_failure'){
+          const result=typeof status.result==='object'&&status.result!==null?status.result as Record<string,unknown>:{};
+          if(result.send_state==='confirmed_not_sent'){
+            const failureStage=result.stage==='prepare'||result.stage==='send'||result.stage==='receipt'?result.stage:'send';
+            const failure=new BiliError(result.error_type==='risk'||result.error_type==='auth'||result.error_type==='disabled'?result.error_type:'api',failureStage,'confirmed_not_sent',typeof result.error_code==='string'?result.error_code:'confirmed_api_failure');
+            const allocation=this.store.rescheduleFailedPlan(plan,this.clock());
+            this.store.finishInteractionAttempt({attemptId:attempt.id,outcome:'confirmed_failure',finishedAt:this.clock(),retryAt:allocation.dueAt,retryOverflow:allocation.overflow,failureStage,errorCode:failure.errorCode,evidence:'桥接操作日志确认平台未接受发送'});
+            this.fail(failure,undefined,{bvid:plan.bvid},'interaction');
+            if(!this.live(generation))return;
+          }else{
+            this.store.markRequestInFlight(attempt.id,false,this.clock(),'桥接调用结束，但日志未能证明平台未接收');
+          }
+          continue;
+        }
+        if(status.status==='not_found'){
+          // Missing journal data is not enough evidence to permit an automatic retry.
+          this.store.deferUncertainPoll(plan.id,this.clock());
+          continue;
+        }
+        this.store.markRequestInFlight(attempt.id,false,this.clock(),status.status==='interrupted'?'桥接进程结束，发送结果仍待人工核查':'原桥接调用已结束，平台结果仍不确定');
+      }catch(error){
+        this.store.deferUncertainPoll(plan.id,this.clock());
+        this.fail(error,undefined,{bvid:plan.bvid},'read');
+        if(!this.live(generation))return;
+      }
+    }
+  }
+  private async interact(generation:number){
+    const settings=this.store.settings();if(this.clock()<settings.retryAt)return;
+    await this.pollUncertain(generation);if(!this.live(generation))return;
+    if(this.store.anyRequestInFlight())return;
+    if(this.clock()<this.store.settings().nextInteraction)return;
+    const plans=this.store.dueInteractionPlans(this.clock(),100);
+    for(const plan of plans){
+      if(!this.live(generation))return;const now=this.clock();if(plan.nextPrepareAt!==null&&plan.nextPrepareAt>now)continue;
+      const topic=plan.topicId===null?undefined:this.store.topic(plan.topicId);if(!topic?.enabled||plan.orphaned||plan.cancelRequested)continue;
+      const dispatchClass=this.dispatchClass(plan,now);const action=plan.plannedAction;let effective=action;let target='';let targetId=0;let targetUid='';let fallback='';let candidates:OrdinaryComment[]=[];
+      if(!this.store.canClaimNow(now,topic.id,action,dispatchClass)&&!(action==='reply'&&this.store.canClaimNow(now,topic.id,'comment',dispatchClass))){this.store.deferPlanForCapacity(plan.id,plan.version,now);continue;}
+      if(action==='reply'){
+        if(!this.store.beginPlanPreparation(plan.id,plan.version,now))continue;
+        try{candidates=(await this.bili.comments(plan.bvid)).filter(value=>safeComment(value)&&value.uid!==this.store.account().uid);}
+        catch(error){this.store.recordPlanPreparationFailure(plan.id,plan.version,now,now+86400000,error instanceof BiliError?error.errorCode||'prepare_failed':'prepare_failed','回复对象读取失败');this.fail(error,topic,{bvid:plan.bvid},'read');continue;}
+        if(candidates.length){const chosen=candidates[Math.floor(this.random()*candidates.length)];target=chosen.user;targetId=chosen.rpid;targetUid=chosen.uid??'';}
+        else{effective='comment';fallback='成功读取评论但没有合格对象';}
+      }
+      if(!this.store.canClaimNow(this.clock(),topic.id,effective,dispatchClass)){
+        if(action==='reply'&&effective==='comment')this.store.deferPlanPreparation(plan.id,plan.version,this.clock());
+        else this.store.deferPlanForCapacity(plan.id,plan.version,this.clock());
         continue;
       }
-      const roll = this.random() * 100;
-      if (roll < currentTopic.skipProbability) this.log(currentTopic,'skip','概率跳过',details);
-      else {
-        const action = roll < currentTopic.skipProbability + currentTopic.commentProbability ? 'comment' : 'reply';
-        this.store.queue(video.bvid,topic.id,action,now + this.wait(limits.waitMin,limits.waitMax));
-        this.log(currentTopic,'queue','等待互动',{ ...details, content: action === 'comment' ? '视频评论' : '回复普通评论' });
+      // A snapshot may be reused for different videos; only blank templates are unusable.
+      const pool=(effective==='comment'?plan.commentTemplates:plan.replyTemplates).filter(text=>text.trim().length>0);
+      if(!pool.length){this.store.setPlanWaitingTemplate(plan.id,plan.version,this.clock(),'没有可用模板');continue;}
+      const text=pool[Math.min(pool.length-1,Math.floor(this.random()*pool.length))];
+      let account:Account;
+      try{account=await this.bili.checkLogin();}
+      catch(error){
+        const currentPlan=this.store.interactionPlan(plan.id);const at=this.clock();
+        if(currentPlan&&currentPlan.state==='scheduled')this.store.recordPlanPreflightFailure(plan.id,currentPlan.version,at,at+86400000,error instanceof BiliError?error.errorCode||'account_check_failed':'account_check_failed','发送前登录复核失败');
+        this.fail(error,topic,{bvid:plan.bvid},'interaction');continue;
       }
+      const binding=this.store.accountBinding();
+      if(!account.loggedIn||!account.uid||account.uid!==plan.ownerUid||!binding?.verified||binding.uid!==account.uid){
+        const failure=new BiliError('auth','unknown','not_applicable','account_uid_mismatch',undefined,'账号 UID 与计划归属不一致，请核对后手动恢复');
+        const currentPlan=this.store.interactionPlan(plan.id);const at=this.clock();
+        if(currentPlan&&currentPlan.state==='scheduled')this.store.recordPlanPreflightFailure(plan.id,currentPlan.version,at,at+86400000,failure.errorCode,failure.message);
+        const current=this.store.settings();current.account=account;this.store.saveSettings(current);
+        this.fail(failure,topic,{bvid:plan.bvid},'interaction');continue;
+      }
+      const current=this.store.settings();const latest=this.store.interactionPlan(plan.id);if(!latest||latest.version!==plan.version||!this.live(generation)||!this.store.topic(topic.id)?.enabled)continue;
+      const claimTime=this.clock();const currentClass=this.dispatchClass(latest,claimTime);if(!this.store.canClaimNow(claimTime,topic.id,effective,currentClass)){this.store.deferPlanForCapacity(plan.id,latest.version,claimTime);continue;}
+      const attempt=this.store.claimInteractionPlan({planId:latest.id,expectedVersion:latest.version,now:claimTime,quotaDay:dayStart(claimTime),dispatchClass:currentClass,billingTopicId:topic.id,billingTopicName:topic.name,senderUid:account.uid,effectiveAction:effective,fallbackReason:fallback,content:text,target,targetId,targetUid,nextInteractionAt:claimTime+this.wait(current.limits.waitMin,current.limits.waitMax),limits:current.limits});
+      if(!attempt)continue;
+      try{const receipt=await this.bili.post(latest.bvid,text,targetId,attempt.operationId);this.store.finishInteractionAttempt({attemptId:attempt.id,outcome:'succeeded',finishedAt:this.clock(),receipt:JSON.stringify(receipt??{}),failureStage:'receipt',evidence:'收到可信发送成功结果'});const complete=this.store.settings();complete.failures=0;complete.retryAt=0;this.store.saveSettings(complete);const video=videoSchema.parse(JSON.parse(latest.video));this.log(topic,effective,'成功',{keyword:latest.keyword,bvid:latest.bvid,title:video.title,author:video.author,content:text,target});}
+      catch(error){const failure=error instanceof BiliError?error:new BiliError('api','send','uncertain');const outcome=failure.sendState==='confirmed_not_sent'?'confirmed_failure':'uncertain';const requestInFlight=outcome==='uncertain';const allocation=outcome==='confirmed_failure'?this.store.rescheduleFailedPlan(latest,this.clock()):undefined;this.store.finishInteractionAttempt({attemptId:attempt.id,outcome,finishedAt:this.clock(),requestInFlight,failureStage:failure.stage==='unknown'?'send':failure.stage,errorCode:failure.errorCode||failure.kind,retryAt:allocation?.dueAt,retryOverflow:allocation?.overflow??false,evidence:outcome==='confirmed_failure'?'已确认未发送':'发送结果不能确定'});this.fail(failure,topic,{keyword:latest.keyword,bvid:latest.bvid,content:text,target},'interaction');}
+      return;
     }
   }
-  private async interact(generation: number) {
-    const now = this.clock();
-    const s = this.store.settings();
-    const last = z.object({ last: z.number().nullable() }).parse(this.store.db.prepare('SELECT max(attempted) AS last FROM interactions').get()).last;
-    if (now < s.retryAt || now < s.nextInteraction || (last !== null && now < last + s.limits.waitMin * 60000)) return;
-    const item = this.store.nextQueue(now);
-    if (!item) return;
-    const topic = this.store.topic(item.topic_id);
-    if (!topic?.enabled || this.topicAiError(topic)) return;
-    const video = videoSchema.parse(JSON.parse(item.video));
-    const details = { keyword: item.keyword, bvid: video.bvid, title: video.title, author: video.author };
-    if (!eligible(video, topic, now)) {
-      this.store.db.prepare("UPDATE interactions SET state='skipped' WHERE id=?").run(item.id);
-      this.log(topic,'skip','排队后视频不再满足热度或时间窗',details); return;
-    }
-    const limit = item.action === 'comment' ? s.limits.dailyComment : s.limits.dailyReply;
-    const topicLimit = item.action === 'comment' ? topic.dailyComment : topic.dailyReply;
-    if (this.store.attemptCount(now) >= s.limits.dailyTotal || this.store.attemptCount(now,undefined,item.action) >= limit || this.store.attemptCount(now,topic.id,item.action) >= topicLimit) {
-      this.store.db.prepare('UPDATE interactions SET due=? WHERE id=?').run(dayStart(now)+86400000+this.wait(s.limits.waitMin,s.limits.waitMax),item.id); return;
-    }
-    const skip = (reason: string) => {
-      this.store.db.prepare("UPDATE interactions SET state='skipped' WHERE id=? AND state='queued'").run(item.id);
-      this.log(topic, 'skip', reason, details);
-    };
-    const aiWriting = topic.aiJudgment && topic.writingMode === 'ai';
-    let template: Template | undefined;
-    let text = '';
-    if (!aiWriting) {
-      const pool = this.store.templates().filter(t => t.topicId === topic.id && t.kind === item.action && t.enabled && t.text !== s.lastContent);
-      if (!pool.length) { skip('无可用且不重复的模板'); return; }
-      template = pool[Math.floor(this.random() * pool.length)];
-      text = template.text;
-    }
-    let rpid = 0; let target = '';
-    let candidates: OrdinaryComment[] = [];
-    if (item.action === 'reply') {
-      let comments;
-      try { comments = await this.bili.comments(item.bvid); }
-      catch (error) { this.fail(error,topic,{ ...details, content: text },'interaction'); return; }
-      if (!this.live(generation) || !this.store.topic(topic.id)?.enabled) return;
-      candidates = comments.filter(c => topic.aiJudgment ? aiReplyCandidate(c, this.store.account().uid) : safeComment(c) && c.uid !== this.store.account().uid);
-      if (!candidates.length) { skip('无可确认安全的普通评论'); return; }
-      if (!aiWriting) {
-        const chosen = candidates[Math.floor(this.random() * candidates.length)]; rpid = chosen.rpid; target = chosen.user;
-      }
-    }
-    if (aiWriting) {
-      try {
-        const written = await this.ai.write(topic, video, item.keyword, candidates);
-        if (!safeAiText(written.text) || (item.action === 'reply' ? !candidates.some(c => c.rpid === written.rpid) : written.rpid !== 0)) throw new AiFailure('AI 撰写未通过本地检查，已跳过');
-        text = written.text; rpid = written.rpid; target = candidates.find(c => c.rpid === rpid)?.user ?? '';
-      } catch (error) { skip(error instanceof AiFailure ? error.message : 'AI 撰写失败，已跳过'); return; }
-      if (!this.live(generation) || !this.store.topic(topic.id)?.enabled) return;
-    }
-    // Recheck login immediately before writing, after comment reads and before claiming.
-    try {
-      const account = await this.bili.checkLogin();
-      if (!this.live(generation) || !this.store.topic(topic.id)?.enabled) return;
-      if (!account.loggedIn) throw new BiliError('auth');
-      const latest = this.store.settings();
-      const latestTopic = this.store.topic(topic.id);
-      if (!latestTopic || this.topicAiError(latestTopic)) return;
-      if (latestTopic.aiJudgment !== topic.aiJudgment) return;
-      if (topic.aiJudgment && (latestTopic.writingMode !== topic.writingMode || (aiWriting && latestTopic.style !== topic.style))) return;
-      const claimTime = this.clock();
-      if (!eligible(video, latestTopic, claimTime)) { skip('发送前视频不再满足热度或时间窗'); return; }
-      const lastAttempt = z.object({ last: z.number().nullable() }).parse(this.store.db.prepare('SELECT max(attempted) AS last FROM interactions').get()).last;
-      if (claimTime < latest.nextInteraction || (lastAttempt !== null && claimTime < lastAttempt + latest.limits.waitMin * 60000)) return;
-      const latestLimit = item.action === 'comment' ? latest.limits.dailyComment : latest.limits.dailyReply;
-      const latestTopicLimit = item.action === 'comment' ? latestTopic.dailyComment : latestTopic.dailyReply;
-      if (this.store.attemptCount(this.clock()) >= latest.limits.dailyTotal || this.store.attemptCount(this.clock(),undefined,item.action) >= latestLimit || this.store.attemptCount(this.clock(),topic.id,item.action) >= latestTopicLimit) return;
-      if (text === latest.lastContent) { if (aiWriting) skip('AI 撰写与上一条相同，已跳过'); return; }
-      if (template && !this.store.templates().some(t => t.id === template.id && t.enabled && t.text === text && t.topicId === topic.id && t.kind === item.action)) return;
-      // Claim + persist pacing before network I/O: a timeout/crash must never replay this video.
-      const claim = this.store.db.prepare("UPDATE interactions SET state='claimed',attempted=?,content=?,target=? WHERE id=? AND state='queued'").run(claimTime,text,target,item.id);
-      if (!claim.changes) return;
-      const current = this.store.settings(); current.lastContent = text; current.nextInteraction = claimTime + this.wait(current.limits.waitMin,current.limits.waitMax); this.store.saveSettings(current);
-      const receipt = await this.bili.post(item.bvid,text,rpid);
-      this.store.db.prepare("UPDATE interactions SET state='succeeded',receipt=? WHERE id=?").run(JSON.stringify(receipt ?? {}),item.id);
-      const successful = this.store.settings(); successful.failures = 0; successful.retryAt = 0; this.store.saveSettings(successful);
-      this.log(topic,item.action,'成功',{ ...details, content: text, target });
-    } catch (error) {
-      this.store.db.prepare("UPDATE interactions SET state='failed' WHERE id=? AND state='claimed'").run(item.id);
-      this.fail(error,topic,{ ...details, content: text, target },'interaction');
-    }
-  }
-  async close() { clearInterval(this.timer); await this.pause('服务停止'); }
+  async close(){clearInterval(this.timer);await this.pause('服务停止');}
 }

@@ -7,7 +7,7 @@ import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { Store } from './store.js';
 import { Scheduler } from './scheduler.js';
 import { AiConfigError, AiFailure, OpenAiPatrol, chatCompletionsUrl } from './ai.js';
-import { BiliError, aiConfigSchema, limitsSchema, topicSchema, templateSchema, type Bilibili } from './model.js';
+import { BiliError, dayStart, aiConfigSchema, limitsSchema, topicSchema, templateSchema, type Bilibili } from './model.js';
 import { saveCookie, clearCookie, parseCookie } from './auth.js';
 export interface ApplicationBilibili extends Bilibili {
   tools(): Promise<Tool[]>;
@@ -53,8 +53,47 @@ export async function createApp(store: Store, bili: ApplicationBilibili, schedul
   app.get('/api/health', () => ({ status: 'ok', version: '1.0.0' }));
   app.get('/api/state', () => {
     const now = Date.now();
-    const queue = z.object({ n: z.number() }).parse(store.db.prepare("SELECT count(*) n FROM interactions WHERE state='queued'").get());
-    return { settings: store.settings(), topics: store.topics(now), templates: store.templates(), recentComments: store.recentComments(10), today: { discover: store.count('discover',now), comment: store.count('comment',now), reply: store.count('reply',now), skip: store.count('skip',now), error: store.count('error',now) }, system: { version: '1.0.0', node: process.version, uptime: Math.floor(process.uptime()), writesEnabled, queued: queue.n } };
+    const queue = store.db.prepare("SELECT count(*) AS n FROM interaction_plans WHERE state IN ('scheduled','waiting_template','paused_channel')").get() as { n: number };
+    const plans = store.interactionPlans({ limit: 200 });
+    const today=dayStart(now);
+    const metrics=store.db.prepare(`SELECT
+      (SELECT count(*) FROM interaction_plans WHERE first_enqueued_at>=?) AS created_today,
+      (SELECT count(*) FROM interaction_plans WHERE first_enqueued_at>=? AND deferred=1) AS deferred_today,
+      (SELECT count(*) FROM interaction_attempts WHERE started_at>=? AND status='succeeded') AS succeeded_today,
+      (SELECT count(*) FROM interaction_plans WHERE state='scheduled' AND (cycle_deadline_day<? OR (overflow=1 AND cycle_deadline_day<=?))) AS overdue,
+      (SELECT count(*) FROM interaction_plans WHERE state IN ('scheduled','waiting_template','paused_channel') AND overflow=1) AS overflow,
+      (SELECT min(cycle_deadline_day) FROM interaction_plans WHERE state='scheduled' AND (cycle_deadline_day<? OR (overflow=1 AND cycle_deadline_day<=?))) AS earliest_overdue`).get(today,today,today,today,today,today,today) as { created_today:number;deferred_today:number;succeeded_today:number;overdue:number;overflow:number;earliest_overdue:number|null };
+    const binding=store.accountBinding();
+    return { settings: store.settings(), topics: store.topics(now), templates: store.templates(), plans, recentComments: store.recentComments(10), today: { discover: metrics.created_today, deferred:metrics.deferred_today, comment: store.attemptCount(now,undefined,'comment'), reply: store.attemptCount(now,undefined,'reply'), skip: store.count('skip',now), error: store.count('error',now) }, system: { version: '1.0.0', node: process.version, uptime: Math.floor(process.uptime()), writesEnabled, queued: queue.n, attempts: store.attemptCount(now), overdue: metrics.overdue, overflow:metrics.overflow, createdToday:metrics.created_today, succeededToday:metrics.succeeded_today, earliestOverdue:metrics.earliest_overdue, accountBinding:binding??null, legacyOwnershipPending:store.legacyOwnershipPending() } };
+  });
+  app.get('/api/plans', request => {
+    const query=z.object({ state: z.enum(['scheduled','waiting_template','paused_channel','claimed','succeeded','uncertain','manual_review','cancelled']).optional(), limit:z.coerce.number().int().min(1).max(500).default(100), offset:z.coerce.number().int().min(0).default(0) }).parse(request.query);
+    return { items:store.interactionPlans(query),total:store.interactionPlanCount(query.state) };
+  });
+  app.get('/api/plans/:id', request => {
+    const id=z.object({id:z.coerce.number().int().positive()}).parse(request.params).id; const plan=store.interactionPlan(id); if(!plan) return {error:'计划不存在'};
+    return {plan,attempts:store.interactionAttempts(id),events:store.interactionEvents(id)};
+  });
+  app.post('/api/plans/:id/cancel', request => { const id=z.coerce.number().int().positive().parse((request.params as {id:string}).id); const body=z.object({version:z.number().int().nonnegative(),reason:z.string().trim().max(300).default('用户取消')}).parse(request.body); if(!store.cancelInteractionPlan(id,body.version,Date.now(),body.reason)) throw new Error('计划已变化或不可取消'); return {ok:true}; });
+  app.post('/api/attempts/:id/resolve', request => { const id=z.coerce.number().int().positive().parse((request.params as {id:string}).id); const body=z.object({action:z.enum(['succeeded','not_sent']),evidence:z.string().trim().min(1).max(500)}).parse(request.body); return store.resolveUncertainAttempt(id,body.action,Date.now(),body.evidence); });
+  app.put('/api/plans/:id/templates', request => { const id=z.coerce.number().int().positive().parse((request.params as {id:string}).id); const body=z.object({version:z.number().int().nonnegative(),commentTemplates:z.array(z.string()),replyTemplates:z.array(z.string())}).parse(request.body); return store.updatePlanTemplates(id,body.version,body.commentTemplates,body.replyTemplates); });
+  app.post('/api/account/bind-legacy', async (request,reply) => {
+    z.object({confirmLegacyOwnership:z.literal(true)}).parse(request.body);
+    const account=await bili.checkLogin();
+    if(!account.loggedIn||!account.uid)return reply.code(409).send({error:'当前账号未通过登录验证，不能绑定旧数据库'});
+    const result=store.bindAccount(account.uid,true,true);
+    if(!result.ok)return reply.code(409).send({error:result.reason});
+    const settings=store.settings();settings.account=account;store.saveSettings(settings);
+    return {ok:true,binding:result.binding};
+  });
+  app.post('/api/plans/:id/adopt-legacy', async (request,reply) => {
+    const id=z.coerce.number().int().positive().parse((request.params as {id:string}).id);
+    const body=z.object({version:z.number().int().nonnegative()}).parse(request.body);
+    const account=await bili.checkLogin();const binding=store.accountBinding();
+    if(!account.loggedIn||!account.uid||!binding?.verified||binding.uid!==account.uid)return reply.code(409).send({error:'当前登录账号与本机数据库绑定不一致'});
+    const settings=store.settings();settings.account=account;store.saveSettings(settings);
+    try{return store.adoptLegacyPlan(id,body.version,account.uid);}
+    catch(error){return reply.code(409).send({error:error instanceof Error?error.message:'旧计划不能恢复'});}
   });
   app.post('/api/topics', request => ({ id: scheduler.saveTopic(topicSchema.parse(request.body)) }));
   app.put('/api/topics/:id', request => {
@@ -78,7 +117,7 @@ export async function createApp(store: Store, bili: ApplicationBilibili, schedul
     const filter = z.object({ action: z.enum(['all','judge','comment','reply','skip','error']).default('all'), offset: z.coerce.number().int().min(0).default(0) }).parse(request.query);
     return store.activity(filter.action,100,filter.offset);
   });
-  app.put('/api/limits', request => { const s = store.settings(); s.limits = limitsSchema.parse(request.body); store.saveSettings(s); return { ok: true }; });
+  app.put('/api/limits', request => { const s = store.settings(); const previous=s.limits; s.limits = limitsSchema.parse(request.body); store.saveSettings(s); if(previous.dailyTotal!==s.limits.dailyTotal||previous.dailyComment!==s.limits.dailyComment||previous.dailyReply!==s.limits.dailyReply)store.rebalanceCapacity(); return { ok: true }; });
   app.put('/api/ai/settings', request => {
     // Omitted key keeps the saved secret; an explicit empty string clears it.
     const update = aiConfigSchema.extend({ apiKey: aiConfigSchema.shape.apiKey.optional() }).strict().parse(request.body);
