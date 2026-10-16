@@ -22,7 +22,7 @@ export class Scheduler {
     this.runtime=schedulerStatusSchema.parse({phase,phaseSince:now,serverNow:now,reasonCode,reason,nextAction:options.nextAction??{kind:'none',at:null},deadlineAt:options.deadlineAt??null,timeoutAt:options.timeoutAt??null,current:options.current??null,inFlight:options.inFlight??false,pauseRequested:options.pauseRequested??false});
   }
   private reasonCodeForPause(reason:string):SchedulerReasonCode {
-    if(reason===STARTUP_PAUSE)return 'startup_paused';
+    if(reason===STARTUP_PAUSE||reason.startsWith('启动后暂停'))return 'startup_paused';
     if(/风控|验证码/.test(reason))return 'risk_paused';
     if(/登录|账号|UID/.test(reason))return 'auth_required';
     if(/写操作/.test(reason))return 'writes_disabled';
