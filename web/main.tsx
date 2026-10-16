@@ -1,9 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { z } from 'zod';
-import { topicSchema, templateSchema, settingsSchema, aiSettingsSchema, activitySchema, recentCommentSchema, interactionPlanSchema, interactionAttemptSchema, type TopicConfig, type Topic, type Template, type Limits, type Activity, type RecentComment, type InteractionPlan } from '../server/model.js';
+import { topicSchema, templateSchema, settingsSchema, aiSettingsSchema, activitySchema, recentCommentSchema, interactionPlanSchema, interactionAttemptSchema, queueSummarySchema, schedulerStatusSchema, type TopicConfig, type Topic, type Template, type Limits, type Activity, type RecentComment, type InteractionPlan } from '../server/model.js';
 import './style.css';
 const stateSchema = z.object({
+  serverNow: z.number(),
+  runtime: schedulerStatusSchema,
+  queue: queueSummarySchema,
   settings: settingsSchema,
   topics: z.array(topicSchema.and(z.object({ id: z.number(), nextSearch: z.number(), lastRun: z.number().nullable(), todayDiscovered: z.number(), todayInteractions: z.number() }))),
   templates: z.array(templateSchema.extend({ id: z.number() })), plans: z.array(interactionPlanSchema).default([]),
@@ -64,8 +67,32 @@ function App() {
     </main>
   </div>;
 }
+function useServerClock(serverNow: number) {
+  const offset=useRef(serverNow-Date.now());
+  const [now,setNow]=useState(serverNow);
+  useEffect(() => { offset.current=serverNow-Date.now(); setNow(serverNow); },[serverNow]);
+  useEffect(() => { const timer=setInterval(() => setNow(Date.now()+offset.current),1000); return () => clearInterval(timer); },[]);
+  return now;
+}
+function duration(ms: number) {
+  const total=Math.max(0,Math.floor(ms/1000)); const days=Math.floor(total/86400); const hours=Math.floor(total%86400/3600); const minutes=Math.floor(total%3600/60); const seconds=total%60;
+  if(days>0)return `${days}天 ${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}`;
+  return `${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}`;
+}
+function countdown(at: number | null, now: number) {
+  if(at===null)return '—'; const delta=at-now; return delta>=0?duration(delta):`已到期 ${duration(-delta)}`;
+}
+const phaseLabels: Record<string,string> = { idle:'空闲',checking_login:'检查登录',searching:'搜索中',waiting_search:'等待搜索',waiting_plan:'等待互动计划',preparing_reply:'准备回复',reading_comments:'读取评论',sending:'发送中',waiting_receipt:'等待平台回执',backoff:'退避等待',paused:'已暂停',pause_requested:'暂停中',manual_review:'等待人工处理',uncertain:'结果不确定' };
+const actionLabels: Record<string,string> = { comment:'评论',reply:'回复',search:'搜索',interaction:'互动',retry_search:'重试搜索',retry_interaction:'重试互动',login_check:'检查登录',manual_action:'人工处理',none:'无' };
 function Dashboard({ state }: { state: State }) {
-  return <><section className="status-line"><span className={`dot ${state.settings.running ? 'running' : ''}`} /><strong>{state.settings.running ? 'Running / 巡逻中' : 'Paused / 已暂停'}</strong><span>{state.settings.pauseReason || '按关键词匹配新视频，并执行已排程计划'}</span></section><h2>今天 <small>Asia/Shanghai · 写入尝试按账号日计费</small></h2><div className="metrics">{[['discover','新建计划'],['deferred','延后计划'],['comment','评论尝试'],['reply','回复尝试'],['error','失败事件']].map(([action,label]) => <div key={action}><span>{label}</span><strong>{state.today[action] ?? 0}</strong></div>)}</div><section><h2>计划积压 <small>{state.system.queued} 条待执行</small></h2><div className="metrics"><div><span>逾期任务</span><strong>{state.system.overdue}</strong></div><div><span>容量溢出</span><strong>{state.system.overflow}</strong></div><div><span>今日已完成</span><strong>{state.system.succeededToday}</strong></div><div><span>今日新增</span><strong>{state.system.createdToday}</strong></div></div>{state.system.earliestOverdue !== null && <p className="warning">最早逾期截止日：{new Date(state.system.earliestOverdue).toLocaleDateString('zh-CN')}。逾期任务最多使用每日总互动额度的一半。</p>}</section><section><h2>巡逻频道 <small>{state.topics.filter(t => t.enabled).length} 个启用</small></h2>{!state.topics.length ? <p className="empty">还没有频道。先创建停用频道，添加评论与回复模板后再启用。</p> : state.topics.map(topic => <div className="list-row" key={topic.id}><strong>{topic.name}</strong><span>{topic.keywords.join(' / ')}</span><span className="tag">{topic.enabled ? '已启用' : '已暂停'}</span></div>)}</section><section><h2>最近评论 <small>仅含已确认发送成功的评论与回复</small></h2><RecentComments rows={state.recentComments} /></section></>;
+  const now=useServerClock(state.serverNow); const runtime=state.runtime; const current=runtime.current; const activePlans=state.plans.filter(plan => ['scheduled','waiting_template','paused_channel','claimed','uncertain','manual_review'].includes(plan.state)).slice(0,8);
+  const phase=phaseLabels[runtime.phase]??runtime.phase; const nextKind=actionLabels[runtime.nextAction.kind]??runtime.nextAction.kind;
+  return <><section className={`runtime-card phase-${runtime.phase}`}>
+    <div className="runtime-top"><div><span className="eyebrow">当前程序状态</span><h2>{phase}</h2></div><span className={`runtime-badge ${state.settings.running ? 'ok' : 'paused'}`}>{state.settings.running ? '巡逻运行中' : '巡逻已暂停'}</span></div>
+    <p className="runtime-reason">{runtime.reason || (state.settings.running ? '正在按计划运行' : state.settings.pauseReason || '等待人工启动')}</p>
+    <div className="runtime-grid"><div><span>下一步</span><strong>{nextKind}</strong></div><div><span>倒计时</span><strong className="countdown">{runtime.nextAction.at===null?'—':countdown(runtime.nextAction.at,now)}</strong></div><div><span>当前阶段已运行</span><strong>{duration(now-runtime.phaseSince)}</strong></div><div><span>请求状态</span><strong>{runtime.inFlight ? (runtime.timeoutAt ? `进行中 · 最长 ${countdown(runtime.timeoutAt,now)}` : '进行中') : '无在途请求'}</strong></div></div>
+    {current && <div className="runtime-current"><span>{current.action ? actionLabels[current.action] : '当前对象'}</span><strong>{current.title || current.bvid || current.keyword || '处理中'}</strong>{current.keyword && <small>关键词：{current.keyword}</small>}</div>}
+  </section><h2>今天 <small>Asia/Shanghai · 写入尝试按账号日计费</small></h2><div className="metrics">{[['discover','新建计划'],['deferred','延后计划'],['comment','评论尝试'],['reply','回复尝试'],['error','失败事件']].map(([action,label]) => <div key={action}><span>{label}</span><strong>{state.today[action] ?? 0}</strong></div>)}</div><section><h2>计划积压 <small>{state.queue.pending} 条待处理</small></h2><div className="metrics"><div><span>已到期</span><strong>{state.queue.due}</strong></div><div><span>逾期任务</span><strong>{state.queue.overdue}</strong></div><div><span>发送中</span><strong>{state.queue.claimed}</strong></div><div><span>结果不确定</span><strong>{state.queue.uncertain}</strong></div><div><span>等待模板</span><strong>{state.queue.waitingTemplate}</strong></div></div>{state.queue.earliestOverdueAt !== null && <p className="warning">最早逾期截止日：{new Date(state.queue.earliestOverdueAt).toLocaleDateString('zh-CN')}。逾期任务最多使用每日总互动额度的一半。</p>}</section><section><div className="section-heading"><h2>最近计划 <small>按计划时间排序</small></h2><span className="tag">服务时间 {new Date(now).toLocaleTimeString('zh-CN',{hour12:false})}</span></div>{!activePlans.length ? <p className="empty">当前没有待处理计划。{runtime.nextAction.at ? `下一步是${nextKind}。` : '等待新的搜索任务。'}</p> : <div className="plan-timeline">{activePlans.map(plan => <div className="plan-timeline-row" key={plan.id}><span className={`plan-state state-${plan.state}`}>{plan.state==='scheduled'?'待执行':plan.state==='claimed'?'发送中':plan.state==='waiting_template'?'等待模板':plan.state==='paused_channel'?'频道暂停':plan.state==='uncertain'?'结果不确定':plan.state==='manual_review'?'人工核查':plan.state}</span><strong>{actionLabels[plan.plannedAction]??plan.plannedAction}</strong><span className="timeline-title">{JSON.parse(plan.video).title}</span><span className="timeline-due">{plan.state==='scheduled'?countdown(plan.dueAt,now):plan.state==='claimed'?'处理中':plan.state==='uncertain'?'等待人工':'无需执行'}</span></div>)}</div>}</section><section><h2>巡逻频道 <small>{state.topics.filter(t => t.enabled).length} 个启用</small></h2>{!state.topics.length ? <p className="empty">还没有频道。先创建停用频道，添加评论与回复模板后再启用。</p> : state.topics.map(topic => <div className="list-row" key={topic.id}><strong>{topic.name}</strong><span>{topic.keywords.join(' / ')}</span><span className="tag">{topic.enabled ? '已启用' : '已暂停'}</span></div>)}</section><section><h2>最近评论 <small>仅含已确认发送成功的评论与回复</small></h2><RecentComments rows={state.recentComments} /></section></>;
 }
 const compact = new Intl.NumberFormat('zh-CN',{ notation: 'compact', maximumFractionDigits: 1 });
 function commentUrl(row: RecentComment) {
