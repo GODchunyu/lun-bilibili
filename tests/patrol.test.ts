@@ -29,6 +29,20 @@ function setup(random=()=>0, store=new Store(':memory:')) {
 }
 const video=(bvid:string,aid:number,title:string,author='普通UP'):Video=>({bvid,aid,title,author,play:0,pubdate:1});
 
+test('scheduler status exposes startup pause, current time, and the next interaction',async()=>{
+  const f=setup();
+  try {
+    const initial=f.scheduler.status();
+    assert.equal(initial.phase,'paused');assert.equal(initial.reasonCode,'startup_paused');assert.equal(initial.pauseRequested,false);assert.equal(initial.inFlight,false);assert.equal(initial.serverNow,f.now());
+    f.bili.videos=[video('BV1000000001',1,'建筑')];
+    await f.scheduler.run();assert.notEqual(f.scheduler.status().phase,'paused');
+    await f.scheduler.tick();
+    const plan=f.store.interactionPlans()[0];const status=f.scheduler.status();
+    assert.equal(status.phase,'waiting_plan');assert.equal(status.nextAction.kind,'interaction');assert.equal(status.nextAction.at,plan.dueAt);assert.equal(status.serverNow,f.now());
+    await f.scheduler.pause('手动暂停');const paused=f.scheduler.status();assert.equal(paused.phase,'paused');assert.equal(paused.reasonCode,'manual_paused');assert.equal(paused.reason,'手动暂停');
+  } finally {await f.scheduler.close();f.store.close();}
+});
+
 test('patrol matches titles only locally and ignores old age/play filters',async()=>{
   const f=setup();f.bili.videos=[video('BV1000000001',1,'建筑教程','无关UP'),video('BV1000000002',2,'完全无关','建筑达人'),video('BV1000000003',3,'完全无关','别的UP'),video('BV1000000004',4,'建','筑')];
   await f.scheduler.run();await f.scheduler.tick();

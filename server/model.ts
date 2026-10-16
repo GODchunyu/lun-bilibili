@@ -58,6 +58,29 @@ export const queueSummarySchema = z.object({
   earliestOverdueAt: z.number().int().nullable(),
 });
 export type QueueSummary = z.infer<typeof queueSummarySchema>;
+export const schedulerPhaseSchema = z.enum(['idle','checking_login','searching','waiting_search','waiting_plan','preparing_reply','reading_comments','sending','waiting_receipt','backoff','paused','pause_requested','manual_review','uncertain']);
+export type SchedulerPhase = z.infer<typeof schedulerPhaseSchema>;
+export const schedulerReasonCodeSchema = z.enum(['none','startup_paused','manual_paused','auth_required','risk_paused','writes_disabled','quota_exhausted','interaction_spacing','read_backoff','interaction_backoff','waiting_template','channel_disabled','no_task','overdue','request_in_flight','uncertain_result','service_stopped']);
+export type SchedulerReasonCode = z.infer<typeof schedulerReasonCodeSchema>;
+export const schedulerActionKindSchema = z.enum(['search','interaction','retry_search','retry_interaction','login_check','manual_action','none']);
+export const schedulerNextActionSchema = z.object({ kind: schedulerActionKindSchema, at: z.number().int().nullable(), topicId: z.number().int().positive().optional(), planId: z.number().int().positive().optional() });
+export const schedulerCurrentSchema = z.object({ topicId: z.number().int().positive().optional(), planId: z.number().int().positive().optional(), action: z.enum(['comment','reply']).optional(), bvid: z.string().optional(), title: z.string().optional(), keyword: z.string().optional() });
+export const schedulerStatusSchema = z.object({
+  phase: schedulerPhaseSchema,
+  phaseSince: z.number().int(),
+  serverNow: z.number().int(),
+  reasonCode: schedulerReasonCodeSchema,
+  reason: z.string(),
+  nextAction: schedulerNextActionSchema,
+  deadlineAt: z.number().int().nullable(),
+  timeoutAt: z.number().int().nullable(),
+  current: schedulerCurrentSchema.nullable(),
+  inFlight: z.boolean(),
+  pauseRequested: z.boolean(),
+});
+export type SchedulerNextAction = z.infer<typeof schedulerNextActionSchema>;
+export type SchedulerCurrent = z.infer<typeof schedulerCurrentSchema>;
+export type SchedulerStatus = z.infer<typeof schedulerStatusSchema>;
 /** Persistent interaction plan and attempt contracts.  These are deliberately
  * independent from the legacy `interactions` queue table so retries never
  * overwrite an earlier send attempt. */
