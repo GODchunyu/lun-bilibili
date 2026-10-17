@@ -52,8 +52,10 @@ export async function createApp(store: Store, bili: ApplicationBilibili, schedul
   });
   app.get('/api/health', () => ({ status: 'ok', version: '1.0.0' }));
   app.get('/api/state', () => {
-    const now = Date.now();
-    const queue = store.queueSummary(now);
+    const now = scheduler.now();
+    const facts = store.runtimeFacts(now);
+    const display = scheduler.display(now,writesEnabled,facts);
+    const queue = facts.queue;
     const plans = store.interactionPlans({ limit: 200 });
     const today=dayStart(now);
     const metrics=store.db.prepare(`SELECT
@@ -64,7 +66,7 @@ export async function createApp(store: Store, bili: ApplicationBilibili, schedul
       (SELECT count(*) FROM interaction_plans WHERE state IN ('scheduled','waiting_template','paused_channel') AND overflow=1) AS overflow,
       (SELECT min(cycle_deadline_day) FROM interaction_plans WHERE state='scheduled' AND (cycle_deadline_day<? OR (overflow=1 AND cycle_deadline_day<=?))) AS earliest_overdue`).get(today,today,today,today,today,today,today) as { created_today:number;deferred_today:number;succeeded_today:number;overdue:number;overflow:number;earliest_overdue:number|null };
     const binding=store.accountBinding();
-    return { serverNow: now, runtime: scheduler.status(), settings: store.settings(), topics: store.topics(now), templates: store.templates(), plans, queue, recentComments: store.recentComments(10), today: { discover: metrics.created_today, deferred:metrics.deferred_today, comment: store.attemptCount(now,undefined,'comment'), reply: store.attemptCount(now,undefined,'reply'), skip: store.count('skip',now), error: store.count('error',now) }, system: { version: '1.0.0', node: process.version, uptime: Math.floor(process.uptime()), writesEnabled, queued: queue.pending, attempts: store.attemptCount(now), overdue: metrics.overdue, overflow:metrics.overflow, createdToday:metrics.created_today, succeededToday:metrics.succeeded_today, earliestOverdue:metrics.earliest_overdue, accountBinding:binding??null, legacyOwnershipPending:store.legacyOwnershipPending() } };
+    return { serverNow: now, display, runtime: scheduler.status(now,display), settings: store.settings(), topics: store.topics(now), templates: store.templates(), plans, queue, recentComments: store.recentComments(10), today: { discover: metrics.created_today, deferred:metrics.deferred_today, comment: store.attemptCount(now,undefined,'comment'), reply: store.attemptCount(now,undefined,'reply'), skip: store.count('skip',now), error: store.count('error',now) }, system: { version: '1.0.0', node: process.version, uptime: Math.floor(process.uptime()), writesEnabled, queued: queue.pending, attempts: store.attemptCount(now), overdue: metrics.overdue, overflow:metrics.overflow, createdToday:metrics.created_today, succeededToday:metrics.succeeded_today, earliestOverdue:metrics.earliest_overdue, accountBinding:binding??null, legacyOwnershipPending:store.legacyOwnershipPending() } };
   });
   app.get('/api/plans', request => {
     const query=z.object({ state: z.enum(['scheduled','waiting_template','paused_channel','claimed','succeeded','uncertain','manual_review','cancelled']).optional(), limit:z.coerce.number().int().min(1).max(500).default(100), offset:z.coerce.number().int().min(0).default(0) }).parse(request.query);
@@ -140,7 +142,7 @@ export async function createApp(store: Store, bili: ApplicationBilibili, schedul
   app.get('/api/tools', () => bili.tools());
   app.post('/api/account/check', async () => {
     try {
-      const account = await bili.checkLogin();
+      const account = await scheduler.observeOperation('checking_login','正在检查登录状态',{},()=>bili.checkLogin());
       const s = store.settings(); s.account = account; store.saveSettings(s);
       if (!account.loggedIn) await scheduler.pause('登录失效，请重新登录');
       return account;
@@ -154,7 +156,7 @@ export async function createApp(store: Store, bili: ApplicationBilibili, schedul
     await bili.resetSession();
     const checking = store.settings(); checking.account = { loggedIn: false, message: '账号已变更，等待登录验证' }; store.saveSettings(checking);
     await saveCookie(credentialFile,cookie,refreshToken);
-    const account = await bili.checkLogin();
+    const account = await scheduler.observeOperation('checking_login','正在检查登录状态',{},()=>bili.checkLogin());
     const s = store.settings(); s.account = account; store.saveSettings(s);
     return account;
   });

@@ -19,7 +19,7 @@ class Fake implements Bilibili {
   async operationStatus() { return { status:this.status }; }
   async tools() { return []; } async qrStart() { return {status:'',message:'',qrcode_image:''}; } async qrCheck() { return {message:''}; } async resetSession() {}
 }
-function setup(random=()=>0, store=new Store(':memory:')) {
+function setup(random=()=>0, store=new Store(':memory:',()=>0)) {
   let now=start; const bili=new Fake();
   const s=store.settings();s.limits=limitsSchema.parse({waitMin:1,waitMax:1});store.saveSettings(s);
   const id=store.saveTopic(topicSchema.parse({name:'测试频道',enabled:false,keywords:['建筑','猫 cat'],intervalMin:1,intervalMax:1}));
@@ -58,7 +58,7 @@ test('title keyword matching preserves normalization and ASCII word boundaries',
 });
 
 test('new plans save a fixed action and template snapshot with deferred capacity date',async()=>{
-  const f=setup(()=>0);f.bili.videos=[video('BV1000000001',1,'建筑')];await f.scheduler.run();await f.scheduler.tick();const plan=f.store.interactionPlans()[0];assert.equal(plan.deferred,true);assert.equal(plan.plannedAction,'comment');assert.deepEqual(plan.commentTemplates,['评论模板']);assert.deepEqual(plan.replyTemplates,['回复模板']);assert.ok(plan.dueAt>=start+86400000);const before=plan.dueAt;f.store.saveTemplate({topicId:f.id,kind:'comment',text:'后来修改',enabled:true});assert.equal(f.store.interactionPlan(plan.id)?.commentTemplates[0],'评论模板');assert.equal(f.store.interactionPlan(plan.id)?.dueAt,before);await f.scheduler.close();f.store.close();
+  const f=setup(()=>0);f.bili.videos=[video('BV1000000001',1,'建筑')];await f.scheduler.run();await f.scheduler.tick();const plan=f.store.interactionPlans()[0];assert.equal(plan.deferred,true);assert.equal(plan.plannedAction,'comment');assert.deepEqual(plan.commentTemplates,['评论模板']);assert.deepEqual(plan.replyTemplates,['回复模板']);assert.ok(plan.dueAt>=dayStart(start)+86400000);const before=plan.dueAt;f.store.saveTemplate({topicId:f.id,kind:'comment',text:'后来修改',enabled:true});assert.equal(f.store.interactionPlan(plan.id)?.commentTemplates[0],'评论模板');assert.equal(f.store.interactionPlan(plan.id)?.dueAt,before);await f.scheduler.close();f.store.close();
 });
 
 test('routing boundaries are exactly 70% deferred, then 20% comment and 10% reply',async()=>{

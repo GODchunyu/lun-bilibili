@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
+import { buildRuntimeDisplay, type RuntimeControl } from './runtime-view.js';
 import { BiliError, dayStart, safeComment, schedulerStatusSchema, videoSchema } from './model.js';
-import type { Account, Bilibili, Topic, TopicConfig, Video, Activity, OrdinaryComment, InteractionAction, SchedulerCurrent, SchedulerNextAction, SchedulerPhase, SchedulerReasonCode, SchedulerStatus } from './model.js';
+import type { Account, Bilibili, Topic, TopicConfig, Video, Activity, OrdinaryComment, InteractionAction, SchedulerCurrent, SchedulerNextAction, SchedulerPhase, SchedulerReasonCode, SchedulerStatus, DisplayOperation, RuntimeDisplay } from './model.js';
 import { keywordMatchesTitle, normalizeSearchText } from './bilibili.js';
 import { Store, STARTUP_PAUSE } from './store.js';
 
@@ -10,17 +12,41 @@ export class Scheduler {
   private generation=0;
   private nextLoginCheck=0;
   private nextIdleCheck=0;
-  private readonly requestTimeoutMs=45000;
+  private readonly instanceId=randomUUID();
+  private snapshotSeq=0;
+  private operationSeq=0;
+  private readonly operations=new Map<string,DisplayOperation>();
+  private startGeneration=0;
+  private pauseGeneration=0;
   private runtime:SchedulerStatus;
 
   constructor(readonly store:Store, private bili:Bilibili, private clock=Date.now, private random=Math.random, _legacyAi?:unknown) {
     const now=this.clock();
     this.runtime=schedulerStatusSchema.parse({phase:'paused',phaseSince:now,serverNow:now,reasonCode:'startup_paused',reason:STARTUP_PAUSE,nextAction:{kind:'manual_action',at:null},deadlineAt:null,timeoutAt:null,current:null,inFlight:false,pauseRequested:false});
   }
-  status():SchedulerStatus { return schedulerStatusSchema.parse({...this.runtime,serverNow:this.clock()}); }
+  now(){return this.clock();}
+  observation():RuntimeControl {
+    const operation=[...this.operations.values()].sort((a,b)=>(a.kind==='sending'?-1:0)-(b.kind==='sending'?-1:0)||a.startedAt-b.startedAt)[0]??null;
+    return {starting:this.startGeneration===this.generation&&this.starts.size>0&&!this.store.settings().running,pauseRequested:this.pauseGeneration===this.generation&&(this.starts.size>0||!!this.active),operation};
+  }
+  async observeOperation<T>(kind:string,label:string,current:{planId?:number;title?:string;keyword?:string},call:()=>Promise<T>):Promise<T>{
+    const id=this.instanceId+':'+(++this.operationSeq);
+    this.operations.set(id,{id,kind,label,startedAt:this.clock(),...current});
+    try{return await call();}finally{this.operations.delete(id);}
+  }
+  display(now:number,writesEnabled:boolean,facts=this.store.runtimeFacts(now)):RuntimeDisplay {
+    return buildRuntimeDisplay(facts,this.observation(),writesEnabled,this.instanceId,++this.snapshotSeq);
+  }
+  status(now=this.clock(),display?:RuntimeDisplay):SchedulerStatus {
+    if(!display)return schedulerStatusSchema.parse({...this.runtime,serverNow:now});
+    const c=display.interaction.state==='ready'||display.interaction.at!==null?display.interaction:display.search;
+    const phase=display.operation?display.operation.kind:display.control.pauseRequested?'pause_requested':display.control.starting?'checking_login':!display.control.running?'paused':c.state==='blocked'?'manual_review':c===display.search?'waiting_search':'waiting_plan';
+    return schedulerStatusSchema.parse({...this.runtime,phase,serverNow:now,reason:display.headline.detail,nextAction:{kind:!display.control.running?'manual_action':c===display.search?'search':'interaction',at:!display.control.running?null:c.at},current:display.operation?{planId:display.operation.planId,title:display.operation.title,keyword:display.operation.keyword}:null,inFlight:display.operation!==null||display.attention.waitingEnd>0,pauseRequested:display.control.pauseRequested,timeoutAt:null});
+  }
   private setStatus(phase:SchedulerPhase,reasonCode:SchedulerReasonCode,reason='',options:{nextAction?:SchedulerNextAction;deadlineAt?:number|null;timeoutAt?:number|null;current?:SchedulerCurrent|null;inFlight?:boolean;pauseRequested?:boolean}={}) {
     const now=this.clock();
-    this.runtime=schedulerStatusSchema.parse({phase,phaseSince:now,serverNow:now,reasonCode,reason,nextAction:options.nextAction??{kind:'none',at:null},deadlineAt:options.deadlineAt??null,timeoutAt:options.timeoutAt??null,current:options.current??null,inFlight:options.inFlight??false,pauseRequested:options.pauseRequested??false});
+    const same=this.runtime.phase===phase&&this.runtime.reasonCode===reasonCode&&this.runtime.reason===reason&&JSON.stringify(this.runtime.current)===JSON.stringify(options.current??null);
+    this.runtime=schedulerStatusSchema.parse({phase,phaseSince:same?this.runtime.phaseSince:now,serverNow:now,reasonCode,reason,nextAction:options.nextAction??{kind:'none',at:null},deadlineAt:options.deadlineAt??null,timeoutAt:options.timeoutAt??null,current:options.current??null,inFlight:options.inFlight??false,pauseRequested:options.pauseRequested??false});
   }
   private reasonCodeForPause(reason:string):SchedulerReasonCode {
     if(reason===STARTUP_PAUSE||reason.startsWith('启动后暂停'))return 'startup_paused';
@@ -46,7 +72,7 @@ export class Scheduler {
   }
   startTimer(){this.timer=setInterval(()=>void this.tick(),1000);}
   async pause(reason='手动暂停'){
-    const generation=++this.generation;
+    const generation=++this.generation;this.pauseGeneration=generation;
     const pending=[...this.starts,...(this.active?[this.active]:[])];
     const settings=this.store.settings();settings.running=false;settings.pauseReason=reason;this.store.saveSettings(settings);
     this.setStatus(pending.length?'pause_requested':'paused',this.reasonCodeForPause(reason),reason,{nextAction:{kind:'manual_action',at:null},inFlight:pending.length>0,pauseRequested:pending.length>0});
@@ -55,7 +81,7 @@ export class Scheduler {
   }
   run():Promise<void>{
     // Establish ownership before the first await; a later pause always wins.
-    const generation=++this.generation;
+    const generation=++this.generation;this.startGeneration=generation;
     const settings=this.store.settings();settings.running=false;settings.pauseReason='启动检查中';this.store.saveSettings(settings);
     const task=this.start(generation);
     this.starts.add(task);
@@ -67,7 +93,7 @@ export class Scheduler {
     if(generation!==this.generation)return;
     this.setStatus('checking_login','none','正在检查登录状态',{nextAction:{kind:'login_check',at:null},inFlight:true});
     try {
-      const account=await this.bili.checkLogin();
+      const account=await this.observeOperation('checking_login','正在检查登录状态',{},()=>this.bili.checkLogin());
       if(generation!==this.generation)return;
       const settings=this.store.settings();settings.account=account;this.store.saveSettings(settings);
       if(!account.loggedIn||!account.uid)throw new BiliError('auth');
@@ -91,6 +117,7 @@ export class Scheduler {
     if(config.enabled&&id){const current=this.store.templates().filter(t=>t.topicId===id&&t.enabled);if(!current.some(t=>t.kind==='comment')||!current.some(t=>t.kind==='reply'))throw new Error('启用频道前需要至少一个评论模板和一个回复模板');}
     return this.store.saveTopic(config,id);
   }
+  private planTitle(video:string,bvid:string){try{const value=JSON.parse(video);return typeof value.title==='string'?value.title:bvid;}catch{return bvid;}}
   private live(generation:number){return generation===this.generation&&this.store.settings().running;}
   private wait(min:number,max:number){return Math.round((min+this.random()*Math.max(0,max-min))*60000);}
   private log(topic:Topic|undefined,action:string,result:string,details:Partial<Activity>={}){
@@ -111,8 +138,8 @@ export class Scheduler {
   }
   private async idleLoginCheck(){
     if(this.clock()<this.nextIdleCheck)return;this.nextIdleCheck=this.clock()+12*3600000;
-    this.setStatus('checking_login','none','正在检查登录状态',{nextAction:{kind:'login_check',at:null},timeoutAt:this.clock()+this.requestTimeoutMs,inFlight:true});
-    try{const account=await this.bili.checkLogin();const settings=this.store.settings();if(settings.running)return;settings.account=account;
+    this.setStatus('checking_login','none','正在检查登录状态',{nextAction:{kind:'login_check',at:null},inFlight:true});
+    try{const account=await this.observeOperation('checking_login','正在检查登录状态',{},()=>this.bili.checkLogin());const settings=this.store.settings();if(settings.running)return;settings.account=account;
       const binding=this.store.accountBinding();if(account.loggedIn&&account.uid&&binding&&binding.uid!==account.uid)settings.pauseReason='账号 UID 与数据库绑定不一致，请人工确认';
       else if(account.loggedIn&&settings.pauseReason===STARTUP_PAUSE)settings.pauseReason='启动后暂停；登录有效，可手动启动巡逻';
       this.store.saveSettings(settings);this.waitingStatus();
@@ -125,8 +152,8 @@ export class Scheduler {
       const topics=this.store.topics(now);const dueSearch=!readBackoff&&topics.some(t=>t.enabled&&t.nextSearch<=now);
       const duePlan=this.store.dueInteractionPlans(now,1).length>0;const dueUncertain=this.store.dueUncertainInteractionPlans(now,1).length>0;
       if(!dueSearch&&!duePlan&&!dueUncertain&&now<this.nextLoginCheck)return;
-      this.setStatus('checking_login','none','正在检查登录状态',{nextAction:{kind:'login_check',at:null},timeoutAt:this.clock()+this.requestTimeoutMs,inFlight:true});
-      const account=await this.bili.checkLogin();if(!this.live(generation))return;
+      this.setStatus('checking_login','none','正在检查登录状态',{nextAction:{kind:'login_check',at:null},inFlight:true});
+      const account=await this.observeOperation('checking_login','正在检查登录状态',{},()=>this.bili.checkLogin());if(!this.live(generation))return;
       if(!account.loggedIn||!account.uid)throw new BiliError('auth');
       const current=this.store.settings();current.account=account;this.store.saveSettings(current);
       const binding=this.store.accountBinding();if(!binding||!binding.verified||binding.uid!==account.uid)throw new BiliError('auth');
@@ -142,8 +169,8 @@ export class Scheduler {
     const keywords=[...new Map(topic.keywords.map(value=>[normalizeSearchText(value),value])).values()];
     const searchedKeyword=keywords[this.store.count('search',now,topic.id)%keywords.length];
     this.store.db.prepare('UPDATE topics SET next_search=?,last_run=? WHERE id=?').run(now+this.wait(topic.intervalMin,topic.intervalMax),now,topic.id);
-    this.setStatus('searching','none','正在搜索视频',{nextAction:{kind:'search',at:null,topicId:topic.id},current:{topicId:topic.id,keyword:searchedKeyword},timeoutAt:this.clock()+this.requestTimeoutMs,inFlight:true});
-    let videos:Video[];try{videos=await this.bili.search(searchedKeyword);}catch(error){this.fail(error,topic,{keyword:searchedKeyword});return;}
+    this.setStatus('searching','none','正在搜索视频',{nextAction:{kind:'search',at:null,topicId:topic.id},current:{topicId:topic.id,keyword:searchedKeyword},inFlight:true});
+    let videos:Video[];try{videos=await this.observeOperation('searching','正在搜索视频',{keyword:searchedKeyword},()=>this.bili.search(searchedKeyword));}catch(error){this.fail(error,topic,{keyword:searchedKeyword});return;}
     if(!this.live(generation))return;const recovered=this.store.settings();recovered.readFailures=0;recovered.readRetryAt=0;this.store.saveSettings(recovered);
     let matched=0,duplicates=0,created=0;
     for(const video of videos){
@@ -170,8 +197,8 @@ export class Scheduler {
       if(!attempt){this.store.deferUncertainPoll(plan.id,this.clock());continue;}
       try{
         if(!this.bili.operationStatus){this.store.deferUncertainPoll(plan.id,this.clock());continue;}
-        this.setStatus('uncertain','uncertain_result','发送结果仍不确定',{nextAction:{kind:'manual_action',at:null},current:{planId:plan.id,action:attempt.effectiveAction,bvid:plan.bvid},timeoutAt:this.clock()+this.requestTimeoutMs,inFlight:true});
-        const status=await this.bili.operationStatus(plan.bvid,attempt.content,attempt.targetId,attempt.operationId);
+        this.setStatus('uncertain','uncertain_result','发送结果仍不确定',{nextAction:{kind:'manual_action',at:null},current:{planId:plan.id,action:attempt.effectiveAction,bvid:plan.bvid},inFlight:true});
+        const status=await this.observeOperation('waiting_receipt','正在查询原请求结果',{planId:plan.id,title:this.planTitle(plan.video,plan.bvid)},()=>this.bili.operationStatus!(plan.bvid,attempt.content,attempt.targetId,attempt.operationId));
         if(status.status==='running'){
           this.store.markRequestInFlight(attempt.id,true,this.clock(),'桥接报告原写请求仍在运行');
           this.store.deferUncertainPoll(plan.id,this.clock());
@@ -221,8 +248,8 @@ export class Scheduler {
       if(!this.store.canClaimNow(now,topic.id,action,dispatchClass)&&!(action==='reply'&&this.store.canClaimNow(now,topic.id,'comment',dispatchClass))){this.store.deferPlanForCapacity(plan.id,plan.version,now);continue;}
       if(action==='reply'){
         if(!this.store.beginPlanPreparation(plan.id,plan.version,now))continue;
-        this.setStatus('reading_comments','none','正在读取回复对象',{nextAction:{kind:'interaction',at:plan.dueAt},current:{planId:plan.id,action:'reply',bvid:plan.bvid,title:JSON.parse(plan.video).title,keyword:plan.keyword},timeoutAt:this.clock()+this.requestTimeoutMs,inFlight:true});
-        try{candidates=(await this.bili.comments(plan.bvid)).filter(value=>safeComment(value)&&value.uid!==this.store.account().uid);}
+        this.setStatus('reading_comments','none','正在读取回复对象',{nextAction:{kind:'interaction',at:plan.dueAt},current:{planId:plan.id,action:'reply',bvid:plan.bvid,title:this.planTitle(plan.video,plan.bvid),keyword:plan.keyword},inFlight:true});
+        try{candidates=(await this.observeOperation('reading_comments','正在寻找回复对象',{planId:plan.id,title:this.planTitle(plan.video,plan.bvid)},()=>this.bili.comments(plan.bvid))).filter(value=>safeComment(value)&&value.uid!==this.store.account().uid);}
         catch(error){this.store.recordPlanPreparationFailure(plan.id,plan.version,now,now+86400000,error instanceof BiliError?error.errorCode||'prepare_failed':'prepare_failed','回复对象读取失败');this.fail(error,topic,{bvid:plan.bvid},'read');continue;}
         if(candidates.length){const chosen=candidates[Math.floor(this.random()*candidates.length)];target=chosen.user;targetId=chosen.rpid;targetUid=chosen.uid??'';}
         else{effective='comment';fallback='成功读取评论但没有合格对象';}
@@ -237,8 +264,8 @@ export class Scheduler {
       if(!pool.length){this.store.setPlanWaitingTemplate(plan.id,plan.version,this.clock(),'没有可用模板');continue;}
       const text=pool[Math.min(pool.length-1,Math.floor(this.random()*pool.length))];
       let account:Account;
-      this.setStatus('checking_login','none','正在复核登录状态',{nextAction:{kind:'login_check',at:null},current:{planId:plan.id,action:effective,bvid:plan.bvid,title:JSON.parse(plan.video).title,keyword:plan.keyword},timeoutAt:this.clock()+this.requestTimeoutMs,inFlight:true});
-      try{account=await this.bili.checkLogin();}
+      this.setStatus('checking_login','none','正在复核登录状态',{nextAction:{kind:'login_check',at:null},current:{planId:plan.id,action:effective,bvid:plan.bvid,title:this.planTitle(plan.video,plan.bvid),keyword:plan.keyword},inFlight:true});
+      try{account=await this.observeOperation('checking_login','正在检查登录状态',{},()=>this.bili.checkLogin());}
       catch(error){
         const currentPlan=this.store.interactionPlan(plan.id);const at=this.clock();
         if(currentPlan&&currentPlan.state==='scheduled')this.store.recordPlanPreflightFailure(plan.id,currentPlan.version,at,at+86400000,error instanceof BiliError?error.errorCode||'account_check_failed':'account_check_failed','发送前登录复核失败');
@@ -256,8 +283,8 @@ export class Scheduler {
       const claimTime=this.clock();const currentClass=this.dispatchClass(latest,claimTime);if(!this.store.canClaimNow(claimTime,topic.id,effective,currentClass)){this.store.deferPlanForCapacity(plan.id,latest.version,claimTime);continue;}
       const attempt=this.store.claimInteractionPlan({planId:latest.id,expectedVersion:latest.version,now:claimTime,quotaDay:dayStart(claimTime),dispatchClass:currentClass,billingTopicId:topic.id,billingTopicName:topic.name,senderUid:account.uid,effectiveAction:effective,fallbackReason:fallback,content:text,target,targetId,targetUid,nextInteractionAt:claimTime+this.wait(current.limits.waitMin,current.limits.waitMax),limits:current.limits});
       if(!attempt)continue;
-      this.setStatus('sending','none','正在发送互动',{nextAction:{kind:'interaction',at:null},current:{planId:latest.id,action:effective,bvid:latest.bvid,title:JSON.parse(latest.video).title,keyword:latest.keyword},timeoutAt:this.clock()+this.requestTimeoutMs,inFlight:true});
-      try{const receipt=await this.bili.post(latest.bvid,text,targetId,attempt.operationId);this.store.finishInteractionAttempt({attemptId:attempt.id,outcome:'succeeded',finishedAt:this.clock(),receipt:JSON.stringify(receipt??{}),failureStage:'receipt',evidence:'收到可信发送成功结果'});const complete=this.store.settings();complete.failures=0;complete.retryAt=0;this.store.saveSettings(complete);const video=videoSchema.parse(JSON.parse(latest.video));this.log(topic,effective,'成功',{keyword:latest.keyword,bvid:latest.bvid,title:video.title,author:video.author,content:text,target});}
+      this.setStatus('sending','none','正在发送互动',{nextAction:{kind:'interaction',at:null},current:{planId:latest.id,action:effective,bvid:latest.bvid,title:this.planTitle(latest.video,latest.bvid),keyword:latest.keyword},inFlight:true});
+      try{const receipt=await this.observeOperation('sending',effective==='comment'?'正在发表评论':'正在发表回复',{planId:latest.id,title:this.planTitle(latest.video,latest.bvid)},()=>this.bili.post(latest.bvid,text,targetId,attempt.operationId));this.store.finishInteractionAttempt({attemptId:attempt.id,outcome:'succeeded',finishedAt:this.clock(),receipt:JSON.stringify(receipt??{}),failureStage:'receipt',evidence:'收到可信发送成功结果'});const complete=this.store.settings();complete.failures=0;complete.retryAt=0;this.store.saveSettings(complete);const video=videoSchema.parse(JSON.parse(latest.video));this.log(topic,effective,'成功',{keyword:latest.keyword,bvid:latest.bvid,title:video.title,author:video.author,content:text,target});}
       catch(error){const failure=error instanceof BiliError?error:new BiliError('api','send','uncertain');const outcome=failure.sendState==='confirmed_not_sent'?'confirmed_failure':'uncertain';const requestInFlight=outcome==='uncertain';const allocation=outcome==='confirmed_failure'?this.store.rescheduleFailedPlan(latest,this.clock()):undefined;this.store.finishInteractionAttempt({attemptId:attempt.id,outcome,finishedAt:this.clock(),requestInFlight,failureStage:failure.stage==='unknown'?'send':failure.stage,errorCode:failure.errorCode||failure.kind,retryAt:allocation?.dueAt,retryOverflow:allocation?.overflow??false,evidence:outcome==='confirmed_failure'?'已确认未发送':'发送结果不能确定'});this.fail(failure,topic,{keyword:latest.keyword,bvid:latest.bvid,content:text,target},'interaction');}
       return;
     }

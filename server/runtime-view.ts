@@ -87,7 +87,7 @@ export function buildRuntimeDisplay(f:RuntimeFacts,control:RuntimeControl,writes
  else if(interaction.state==='blocked')headline={title:'巡逻中 · 视频互动暂缓',detail:interaction.title,tone:'attention'};
  else if(search.state==='idle'&&interaction.state==='idle')headline={title:'巡逻中 · 暂无任务',detail:'等待启用频道或新的计划',tone:'normal'};
  else if(interaction.state==='waiting')headline={title:'巡逻中 · '+interaction.title,detail:f.queue.due?`有${f.queue.due}条计划已到执行时间；安排基于当前已知任务`:'搜索与互动按各自安排检查',tone:'normal'};
- if(operation)headline={title:(control.pauseRequested?'暂停中 · ':'')+operation.label,detail:operation.title??operation.keyword??'等待当前操作返回结果',tone:control.pauseRequested?'paused':'normal'};
+ if(operation)headline={title:(control.pauseRequested?'暂停中 · ':!s.running&&!control.starting?'巡逻已暂停 · ':'')+operation.label,detail:operation.title??operation.keyword??'等待当前操作返回结果',tone:control.pauseRequested?'paused':'normal'};
  const items:RuntimeDisplay['attention']['items']=f.review.map(({plan,requestInFlight,canResolve})=>({key:'plan-'+plan.id,label:plan.state==='uncertain'?'这条互动需要核实发送结果':plan.state==='waiting_template'?'需要补充计划模板':'这条计划需要人工处理',detail:requestInFlight?'原请求结束尚未确认，暂不能确认未发送':'请进入详情核对；未看到评论不等于未发送',href:`/plans?state=${plan.state}&planId=${plan.id}`,planId:plan.id,canResolve}));
  if(!s.account.loggedIn)items.unshift({key:'account',label:'账号需要登录或检查',detail:'请在设置页检查账号',href:'/settings',canResolve:false});
  if(!writesEnabled)items.push({key:'writes',label:'真实写操作未开启',detail:'请在设置页查看说明',href:'/settings',canResolve:false});
