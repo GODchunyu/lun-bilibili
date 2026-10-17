@@ -157,3 +157,21 @@ export function safeComment(c: OrdinaryComment): boolean {
   return /^(好耶|好看|好棒|好可爱|可爱|喜欢|支持|加油|谢谢分享|感谢分享|学习了|学到了|有趣|哈哈哈|哈哈|喵|确实|不错|赞)[！!。\s]*$/.test(c.content.trim());
 }
 export const toolNames = ['bili_login','bili_login_check','bili_check_credential','bili_search','bili_comments','bili_subtitle','bili_danmaku','bili_video_info','bili_reply','bili_crawl','bili_send_dynamic','bili_upload_video','bili_upload_video_multi','bili_send_opus','bili_video_zones','bili_hot_videos','bili_hot_buzzwords','bili_weekly_hot','bili_rank','bili_user_info','bili_user_videos','bili_favorite_lists','bili_favorite_content','bili_send_message','bili_unread_messages','bili_received_replies','bili_received_at_and_likes'] as const;
+
+// Read-only presentation contract. Scheduling and actual send authorization remain separate.
+export const displayReasonSchema=z.object({code:z.string(),label:z.string(),at:z.number().int().nullable()});
+export const displayPlanSchema=z.object({id:z.number().int().positive(),bvid:z.string(),title:z.string(),action:interactionActionSchema,state:interactionStateSchema,topicName:z.string(),deferred:z.boolean(),currentDueAt:z.number().int(),deadlineAt:z.number().int(),beyondCycle:z.boolean(),href:z.string()});
+export const displayChannelSchema=z.object({state:z.enum(['ready','waiting','blocked','idle','busy','paused']),title:z.string(),timeKind:z.enum(['scheduled','eligible','check','unknown','manual']),at:z.number().int().nullable(),reasons:z.array(displayReasonSchema),candidate:displayPlanSchema.nullable(),keyword:z.string().optional(),topicName:z.string().optional()});
+export const displayOperationSchema=z.object({id:z.string(),kind:z.string(),label:z.string(),startedAt:z.number().int(),planId:z.number().int().positive().optional(),title:z.string().optional(),keyword:z.string().optional()});
+export const runtimeDisplaySchema=z.object({
+ schemaVersion:z.literal(1),instanceId:z.string(),snapshotSeq:z.number().int().nonnegative(),serverNow:z.number().int(),
+ control:z.object({running:z.boolean(),starting:z.boolean(),pauseRequested:z.boolean(),writesEnabled:z.boolean()}),operation:displayOperationSchema.nullable(),
+ headline:z.object({title:z.string(),detail:z.string(),tone:z.enum(['normal','attention','paused'])}),search:displayChannelSchema,interaction:displayChannelSchema,
+ attention:z.object({total:z.number().int().nonnegative(),waitingEnd:z.number().int().nonnegative(),items:z.array(z.object({key:z.string(),label:z.string(),detail:z.string(),href:z.string(),planId:z.number().optional(),canResolve:z.boolean()}))}),
+ upcoming:z.array(displayPlanSchema),totals:z.object({commentSucceeded:z.number().int().nonnegative(),replySucceeded:z.number().int().nonnegative(),pending:z.number().int().nonnegative(),needReview:z.number().int().nonnegative(),claimed:z.number().int().nonnegative()}),
+});
+export type DisplayReason=z.infer<typeof displayReasonSchema>;
+export type DisplayPlan=z.infer<typeof displayPlanSchema>;
+export type DisplayChannel=z.infer<typeof displayChannelSchema>;
+export type DisplayOperation=z.infer<typeof displayOperationSchema>;
+export type RuntimeDisplay=z.infer<typeof runtimeDisplaySchema>;

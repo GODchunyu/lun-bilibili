@@ -1,3 +1,5 @@
+import type { RuntimeFacts, RuntimeTopic } from './runtime-view.js';
+import { quotaDecision } from './eligibility.js';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, chmodSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync, fsyncSync } from 'node:fs';
@@ -356,6 +358,45 @@ export class Store {
       pending:z.number(),due:z.number(),next_due_at:z.number().nullable(),scheduled:z.number(),waiting_template:z.number(),paused_channel:z.number(),claimed:z.number(),uncertain:z.number(),manual_review:z.number(),overdue:z.number(),earliest_overdue_at:z.number().nullable(),
     }).parse(row);
     return queueSummarySchema.parse({pending:parsed.pending,due:parsed.due,nextDueAt:parsed.next_due_at,scheduled:parsed.scheduled,waitingTemplate:parsed.waiting_template,pausedChannel:parsed.paused_channel,claimed:parsed.claimed,uncertain:parsed.uncertain,manualReview:parsed.manual_review,overdue:parsed.overdue,earliestOverdueAt:parsed.earliest_overdue_at});
+  }
+  /** A single synchronous, read-only projection; never prepares, claims or reschedules work. */
+  runtimeFacts(now:number):RuntimeFacts {
+    const settings=this.settings();const today=dayStart(now);const tomorrow=today+86400000;
+    const words=new Map<number,string[]>();
+    for(const raw of this.db.prepare('SELECT topic_id,keyword FROM keywords ORDER BY rowid').all()){
+      const r=z.object({topic_id:z.number(),keyword:z.string()}).parse(raw);words.set(r.topic_id,[...(words.get(r.topic_id)??[]),r.keyword]);
+    }
+    const topics:RuntimeTopic[]=this.db.prepare('SELECT id,config,next_search FROM topics ORDER BY id').all().map(raw=>{
+      const r=z.object({id:z.number(),config:z.string(),next_search:z.number()}).parse(raw);
+      const config=topicSchema.parse({...JSON.parse(r.config),keywords:words.get(r.id)??[]});
+      return {...config,id:r.id,nextSearch:r.next_search};
+    });
+    const usage:RuntimeFacts['usage']={total:0,comment:0,reply:0,overdue:0,topic:{},readCount:0,searches:0,topicSearches:{}};
+    const rows=this.db.prepare(`SELECT billing_topic_id AS topic_id,effective_action AS action,dispatch_class AS class,count(*) AS n FROM interaction_attempts WHERE quota_day=? GROUP BY billing_topic_id,effective_action,dispatch_class
+      UNION ALL SELECT i.topic_id,i.action,'ordinary',count(*) FROM interactions i WHERE i.attempted>=? AND i.attempted<? AND NOT EXISTS(SELECT 1 FROM interaction_plans p WHERE p.bvid=i.bvid) GROUP BY i.topic_id,i.action`).all(today,today,tomorrow);
+    for(const raw of rows){
+      const r=z.object({topic_id:z.number().nullable(),action:interactionActionSchema,class:z.string(),n:z.number()}).parse(raw);
+      usage.total+=r.n;usage[r.action]+=r.n;if(['overdue','legacy_unknown'].includes(r.class))usage.overdue+=r.n;
+      if(r.topic_id!==null){usage.topic[r.topic_id]??={comment:0,reply:0};usage.topic[r.topic_id][r.action]+=r.n;}
+    }
+    usage.readCount=countRow.parse(this.db.prepare('SELECT coalesce(sum(read_count),0) n FROM interaction_plans WHERE read_day=?').get(today)).n;
+    for(const raw of this.db.prepare("SELECT topic_id,count(*) n FROM activity WHERE action='search' AND time>=? GROUP BY topic_id").all(today)){
+      const r=z.object({topic_id:z.number().nullable(),n:z.number()}).parse(raw);usage.searches+=r.n;if(r.topic_id!==null)usage.topicSearches[r.topic_id]=r.n;
+    }
+    const success={comment:0,reply:0};
+    for(const raw of this.db.prepare(`SELECT effective_action AS action,count(*) n FROM interaction_attempts WHERE started_at>=? AND started_at<? AND status='succeeded' GROUP BY effective_action
+      UNION ALL SELECT i.action,count(*) n FROM interactions i WHERE i.attempted>=? AND i.attempted<? AND i.state='succeeded' AND NOT EXISTS(SELECT 1 FROM interaction_plans p WHERE p.bvid=i.bvid) GROUP BY i.action`).all(today,tomorrow,today,tomorrow)){
+      const r=z.object({action:interactionActionSchema,n:z.number()}).parse(raw);success[r.action]+=r.n;
+    }
+    const due=this.dueInteractionPlans(now,101);
+    const future=this.db.prepare("SELECT * FROM interaction_plans WHERE state='scheduled' AND due_at>? ORDER BY due_at,id LIMIT 3").all(now).map(r=>this.mapPlan(r));
+    const review=this.db.prepare(`SELECT p.*,a.status AS latest_status,a.request_in_flight AS latest_in_flight FROM interaction_plans p LEFT JOIN interaction_attempts a ON a.id=(SELECT a2.id FROM interaction_attempts a2 WHERE a2.plan_id=p.id ORDER BY a2.attempt_no DESC LIMIT 1)
+      WHERE p.state IN ('uncertain','manual_review','waiting_template') ORDER BY CASE p.state WHEN 'uncertain' THEN 0 WHEN 'manual_review' THEN 1 ELSE 2 END,p.id LIMIT 8`).all().map(raw=>{
+        const r=z.object({latest_status:z.string().nullable(),latest_in_flight:z.number().nullable()}).parse(raw);
+        return {plan:this.mapPlan(raw),requestInFlight:r.latest_in_flight===1,canResolve:['uncertain','manual_review'].includes(r.latest_status??'')&&r.latest_in_flight===0};
+      });
+    const poll=this.db.prepare("SELECT min(coalesce(p.next_prepare_at,?)) AS at FROM interaction_plans p JOIN interaction_attempts a ON a.plan_id=p.id WHERE p.state='uncertain' AND a.request_in_flight=1").get(now);
+    return {now,settings,topics,queue:this.queueSummary(now),binding:this.accountBinding(),due,future,inFlightCount:countRow.parse(this.db.prepare('SELECT count(*) n FROM interaction_attempts WHERE request_in_flight=1').get()).n,pollAt:z.object({at:z.number().nullable()}).parse(poll).at,review,usage,success};
   }
   legacyOwnershipPending() {
     return countRow.parse(this.db.prepare("SELECT count(*) AS n FROM interaction_plans WHERE owner_uid='unknown' AND snapshot_source='legacy_snapshot'").get()).n>0;
@@ -829,15 +870,8 @@ export class Store {
   }
   canClaimNow(now:number,topicId:number,action:'comment'|'reply',dispatchClass:'ordinary'|'overdue') {
     const settings=this.settings();const topic=this.topic(topicId);if(!topic?.enabled)return false;
-    const actionLimit=action==='comment'?settings.limits.dailyComment:settings.limits.dailyReply;
-    const topicLimit=action==='comment'?topic.dailyComment:topic.dailyReply;
-    if(this.attemptCount(now)>=settings.limits.dailyTotal||this.attemptCount(now,undefined,action)>=actionLimit||this.attemptCount(now,topicId,action)>=topicLimit)return false;
-    if(dispatchClass==='overdue'){
-      const day=dayStart(now);const used=countRow.parse(this.db.prepare("SELECT count(*) AS n FROM interaction_attempts WHERE quota_day=? AND dispatch_class IN ('overdue','legacy_unknown')").get(day)).n;
-      const index=Math.floor((day+8*3600000)/86400000);const maximum=Math.floor(settings.limits.dailyTotal/2)+(settings.limits.dailyTotal%2&&index%2===0?1:0);
-      if(used>=maximum)return false;
-    }
-    return true;
+    const day=dayStart(now);const overdue=countRow.parse(this.db.prepare("SELECT count(*) AS n FROM interaction_attempts WHERE quota_day=? AND dispatch_class IN ('overdue','legacy_unknown')").get(day)).n;
+    return quotaDecision(now,settings.limits,topic,action,dispatchClass==='overdue',{total:this.attemptCount(now),action:this.attemptCount(now,undefined,action),topicAction:this.attemptCount(now,topicId,action),overdue}).length===0;
   }
   discover(video: Video, topicId: number, keyword: string, now: number): boolean {
     return !!this.db.prepare('INSERT OR IGNORE INTO discoveries VALUES(?,?,?,?,?,?)').run(video.bvid,video.aid,topicId,JSON.stringify(video),keyword,now).changes;
