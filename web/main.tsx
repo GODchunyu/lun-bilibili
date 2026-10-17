@@ -1,9 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { z } from 'zod';
-import { topicSchema, templateSchema, settingsSchema, aiSettingsSchema, activitySchema, recentCommentSchema, interactionPlanSchema, interactionAttemptSchema, queueSummarySchema, schedulerStatusSchema, type TopicConfig, type Topic, type Template, type Limits, type Activity, type RecentComment, type InteractionPlan } from '../server/model.js';
+import { topicSchema, templateSchema, settingsSchema, aiSettingsSchema, activitySchema, recentCommentSchema, interactionPlanSchema, interactionAttemptSchema, queueSummarySchema, schedulerStatusSchema, runtimeDisplaySchema, type TopicConfig, type Topic, type Template, type Limits, type Activity, type RecentComment, type InteractionPlan } from '../server/model.js';
+import { RuntimePanel } from './runtime-panel.js';
+import { serverTime } from './runtime-time.js';
+import { createStatePoller, type ConnectionState } from './state-poller.js';
 import './style.css';
 const stateSchema = z.object({
+  display: runtimeDisplaySchema,
   serverNow: z.number(),
   runtime: schedulerStatusSchema,
   queue: queueSummarySchema,
@@ -13,7 +17,7 @@ const stateSchema = z.object({
   recentComments: z.array(recentCommentSchema), today: z.record(z.number()),
   system: z.object({ version: z.string(), node: z.string(), uptime: z.number(), writesEnabled: z.boolean(), queued: z.number(), attempts:z.number().default(0), overdue:z.number().default(0), overflow:z.number().default(0), createdToday:z.number().default(0), succeededToday:z.number().default(0), earliestOverdue:z.number().nullable().default(null), accountBinding:z.object({uid:z.string(),boundAt:z.number(),verified:z.boolean()}).nullable().default(null), legacyOwnershipPending:z.boolean().default(false) }),
 });
-type State = z.infer<typeof stateSchema>;
+type State = z.infer<typeof stateSchema> & { receivedAt:number };
 type Mutate = (path: string, method: string, body?: unknown) => Promise<void>;
 const pages = { dashboard: '总览', topics: '巡逻频道', plans: '互动计划', templates: '评论模板', activity: '活动记录', settings: '设置' };
 type Page = keyof typeof pages;
@@ -33,66 +37,52 @@ function App() {
   const [notice,setNotice] = useState('');
   const [dark,setDark] = useState(localStorage.getItem('theme') === 'dark');
   const [busy,setBusy] = useState(false);
-  async function refresh() {
-    try { setState(stateSchema.parse(await api('/state'))); }
-    catch { setNotice('无法连接服务，请检查后端是否运行'); }
-  }
-  useEffect(() => { void refresh(); const timer = setInterval(() => { void refresh(); },5000); return () => clearInterval(timer); },[]);
+  const [connection,setConnection]=useState<ConnectionState>('connecting');
+  const poller=useRef<ReturnType<typeof createStatePoller<State>>|null>(null);
+  async function refresh(){await poller.current?.refresh();}
+  useEffect(()=>{
+    const service=createStatePoller<State>({now:()=>performance.now(),fetch:async signal=>{const response=await fetch('/api/state',{signal});if(!response.ok)throw new Error('state request failed');return response.json();},parse:raw=>({...stateSchema.parse(raw),receivedAt:performance.now()}),version:value=>({instanceId:value.display.instanceId,snapshotSeq:value.display.snapshotSeq}),data:value=>setState(value),connection:setConnection});
+    poller.current=service;service.start();
+    const focus=()=>{if(document.visibilityState==='visible')void service.resync();};
+    const freshness=setInterval(()=>service.checkFreshness(),1000);
+    window.addEventListener('focus',focus);document.addEventListener('visibilitychange',focus);
+    return()=>{service.stop();clearInterval(freshness);window.removeEventListener('focus',focus);document.removeEventListener('visibilitychange',focus);};
+  },[]);
   useEffect(() => { document.documentElement.dataset.theme = dark ? 'dark' : 'light'; localStorage.setItem('theme',dark ? 'dark' : 'light'); },[dark]);
   useEffect(() => {
     const onNavigation = () => { const value = window.location.pathname.slice(1); setPage(value in pages ? value as Page : 'dashboard'); };
     onNavigation(); window.addEventListener('popstate',onNavigation); return () => window.removeEventListener('popstate',onNavigation);
   },[]);
   const mutate: Mutate = async (path,method,body) => {
+    if(connection!=='fresh'&&!(path==='/scheduler'&&(body as {running?:boolean})?.running===false))throw new Error('请等待运行状态更新后再操作');
     setBusy(true); setNotice('');
     try { await api(path,method,body); await refresh(); setNotice('已保存'); }
     catch (error) { setNotice(error instanceof Error ? error.message : '请求失败'); throw error; }
     finally { setBusy(false); }
   };
   return <div className="shell">
-    <aside><a className="brand" href="/dashboard">Yui<span>bilibili patrol</span></a><div className="nav-label">工作空间</div><nav>{Object.entries(pages).map(([key,label],index) => <a key={key} href={`/${key}`} className={page === key ? 'selected' : ''} onClick={event => { event.preventDefault(); setPage(key as Page); history.pushState(null,'',`/${key}`); }}><span>0{index+1}</span>{label}</a>)}</nav><div className="sidebar-bottom"><span className={`dot ${state?.settings.running ? 'running' : ''}`} />{state?.settings.running ? '巡逻中' : '已暂停'}<button onClick={() => setDark(!dark)}>{dark ? '浅色模式' : '深色模式'}</button></div></aside>
-    <main><header><div><div className="eyebrow">YUI / {page.toUpperCase()}</div><h1>{pages[page]}</h1></div>{state && <button disabled={busy} className={state.settings.running ? '' : 'primary'} onClick={() => { void mutate('/scheduler','POST',{ running: !state.settings.running }).catch(() => {}); }}>{state.settings.running ? '暂停巡逻' : '启动巡逻'}</button>}</header>
+    <aside><a className="brand" href="/dashboard">Yui<span>bilibili patrol</span></a><div className="nav-label">工作空间</div><nav>{Object.entries(pages).map(([key,label],index) => <a key={key} href={`/${key}`} className={page === key ? 'selected' : ''} onClick={event => { event.preventDefault(); setPage(key as Page); history.pushState(null,'',`/${key}`); }}><span>0{index+1}</span>{label}</a>)}</nav><div className="sidebar-bottom"><span className={`dot ${connection==='fresh'&&state?.settings.running ? 'running' : ''}`} />{connection!=='fresh'?'状态待更新':state?.settings.running ? '巡逻中' : '已暂停'}<button onClick={() => setDark(!dark)}>{dark ? '浅色模式' : '深色模式'}</button></div></aside>
+    <main><header><div><div className="eyebrow">YUI / {page.toUpperCase()}</div><h1>{pages[page]}</h1></div>{state && <button disabled={busy||(!state.settings.running&&connection!=='fresh')} className={state.settings.running ? '' : 'primary'} onClick={() => { void mutate('/scheduler','POST',{ running: !state.settings.running }).catch(() => {}); }}>{state.settings.running ? '暂停巡逻' : '启动巡逻'}</button>}</header>
       {notice && <div className="notice" role="status">{notice}</div>}
-      {!state ? <p>正在连接本机服务…</p> : <>
+      {!state ? <p role="status">{connection==='incompatible'?'页面与服务版本不兼容，请更新服务或刷新页面。':connection==='offline'?'无法连接本机服务，正在等待恢复。':'正在连接本机服务…'}</p> : <>
         {!state.settings.account.loggedIn && <div className="warning">{state.settings.account.message} · {state.settings.account.message === '登录状态待检查' ? '启动后会自动检查，稍候即可。' : '请到设置登录；未登录不会互动。'}</div>}
         {state.settings.account.loggedIn && state.settings.account.renewal?.status === 'failed' && <div className="warning">登录自动续期失败，当前登录仍可用，12 小时后重试；若持续失败请到设置重新扫码登录。</div>}
-        {page === 'dashboard' && <Dashboard state={state} />}
-        {page === 'topics' && <Topics state={state} mutate={mutate} busy={busy} />}
-        {page === 'plans' && <Plans state={state} mutate={mutate} busy={busy} />}
-        {page === 'templates' && <Templates state={state} mutate={mutate} busy={busy} />}
+        {page === 'dashboard' && <Dashboard state={state} connection={connection} />}
+        {page === 'topics' && <Topics state={state} mutate={mutate} busy={busy||connection!=='fresh'} />}
+        {page === 'plans' && <Plans state={state} mutate={mutate} busy={busy||connection!=='fresh'} />}
+        {page === 'templates' && <Templates state={state} mutate={mutate} busy={busy||connection!=='fresh'} />}
         {page === 'activity' && <Activities />}
-        {page === 'settings' && <Settings state={state} mutate={mutate} refresh={refresh} busy={busy} />}
+        {page === 'settings' && <Settings state={state} mutate={mutate} refresh={refresh} busy={busy||connection!=='fresh'} />}
       </>}
       <footer>Yui-bilibili · 低频巡逻，安全优先 · V1</footer>
     </main>
   </div>;
 }
-function useServerClock(serverNow: number) {
-  const offset=useRef(serverNow-Date.now());
-  const [now,setNow]=useState(serverNow);
-  useEffect(() => { offset.current=serverNow-Date.now(); setNow(serverNow); },[serverNow]);
-  useEffect(() => { const timer=setInterval(() => setNow(Date.now()+offset.current),1000); return () => clearInterval(timer); },[]);
-  return now;
-}
-function duration(ms: number) {
-  const total=Math.max(0,Math.floor(ms/1000)); const days=Math.floor(total/86400); const hours=Math.floor(total%86400/3600); const minutes=Math.floor(total%3600/60); const seconds=total%60;
-  if(days>0)return `${days}天 ${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}`;
-  return `${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}`;
-}
-function countdown(at: number | null, now: number) {
-  if(at===null)return '—'; const delta=at-now; return delta>=0?duration(delta):`已到期 ${duration(-delta)}`;
-}
-const phaseLabels: Record<string,string> = { idle:'空闲',checking_login:'检查登录',searching:'搜索中',waiting_search:'等待搜索',waiting_plan:'等待互动计划',preparing_reply:'准备回复',reading_comments:'读取评论',sending:'发送中',waiting_receipt:'等待平台回执',backoff:'退避等待',paused:'已暂停',pause_requested:'暂停中',manual_review:'等待人工处理',uncertain:'结果不确定' };
-const actionLabels: Record<string,string> = { comment:'评论',reply:'回复',search:'搜索',interaction:'互动',retry_search:'重试搜索',retry_interaction:'重试互动',login_check:'检查登录',manual_action:'人工处理',none:'无' };
-function Dashboard({ state }: { state: State }) {
-  const now=useServerClock(state.serverNow); const runtime=state.runtime; const current=runtime.current; const activePlans=state.plans.filter(plan => ['scheduled','waiting_template','paused_channel','claimed','uncertain','manual_review'].includes(plan.state)).slice(0,8);
-  const phase=phaseLabels[runtime.phase]??runtime.phase; const nextKind=actionLabels[runtime.nextAction.kind]??runtime.nextAction.kind;
-  return <><section className={`runtime-card phase-${runtime.phase}`}>
-    <div className="runtime-top"><div><span className="eyebrow">当前程序状态</span><h2>{phase}</h2></div><span className={`runtime-badge ${state.settings.running ? 'ok' : 'paused'}`}>{state.settings.running ? '巡逻运行中' : '巡逻已暂停'}</span></div>
-    <p className="runtime-reason">{runtime.reason || (state.settings.running ? '正在按计划运行' : state.settings.pauseReason || '等待人工启动')}</p>
-    <div className="runtime-grid"><div><span>下一步</span><strong>{nextKind}</strong></div><div><span>倒计时</span><strong className="countdown">{runtime.nextAction.at===null?'—':countdown(runtime.nextAction.at,now)}</strong></div><div><span>当前阶段已运行</span><strong>{duration(now-runtime.phaseSince)}</strong></div><div><span>请求状态</span><strong>{runtime.inFlight ? (runtime.timeoutAt ? `进行中 · 最长 ${countdown(runtime.timeoutAt,now)}` : '进行中') : '无在途请求'}</strong></div></div>
-    {current && <div className="runtime-current"><span>{current.action ? actionLabels[current.action] : '当前对象'}</span><strong>{current.title || current.bvid || current.keyword || '处理中'}</strong>{current.keyword && <small>关键词：{current.keyword}</small>}</div>}
-  </section><h2>今天 <small>Asia/Shanghai · 写入尝试按账号日计费</small></h2><div className="metrics">{[['discover','新建计划'],['deferred','延后计划'],['comment','评论尝试'],['reply','回复尝试'],['error','失败事件']].map(([action,label]) => <div key={action}><span>{label}</span><strong>{state.today[action] ?? 0}</strong></div>)}</div><section><h2>计划积压 <small>{state.queue.pending} 条待处理</small></h2><div className="metrics"><div><span>已到期</span><strong>{state.queue.due}</strong></div><div><span>逾期任务</span><strong>{state.queue.overdue}</strong></div><div><span>发送中</span><strong>{state.queue.claimed}</strong></div><div><span>结果不确定</span><strong>{state.queue.uncertain}</strong></div><div><span>等待模板</span><strong>{state.queue.waitingTemplate}</strong></div></div>{state.queue.earliestOverdueAt !== null && <p className="warning">最早逾期截止日：{new Date(state.queue.earliestOverdueAt).toLocaleDateString('zh-CN')}。逾期任务最多使用每日总互动额度的一半。</p>}</section><section><div className="section-heading"><h2>最近计划 <small>按计划时间排序</small></h2><span className="tag">服务时间 {new Date(now).toLocaleTimeString('zh-CN',{hour12:false})}</span></div>{!activePlans.length ? <p className="empty">当前没有待处理计划。{runtime.nextAction.at ? `下一步是${nextKind}。` : '等待新的搜索任务。'}</p> : <div className="plan-timeline">{activePlans.map(plan => <div className="plan-timeline-row" key={plan.id}><span className={`plan-state state-${plan.state}`}>{plan.state==='scheduled'?'待执行':plan.state==='claimed'?'发送中':plan.state==='waiting_template'?'等待模板':plan.state==='paused_channel'?'频道暂停':plan.state==='uncertain'?'结果不确定':plan.state==='manual_review'?'人工核查':plan.state}</span><strong>{actionLabels[plan.plannedAction]??plan.plannedAction}</strong><span className="timeline-title">{JSON.parse(plan.video).title}</span><span className="timeline-due">{plan.state==='scheduled'?countdown(plan.dueAt,now):plan.state==='claimed'?'处理中':plan.state==='uncertain'?'等待人工':'无需执行'}</span></div>)}</div>}</section><section><h2>巡逻频道 <small>{state.topics.filter(t => t.enabled).length} 个启用</small></h2>{!state.topics.length ? <p className="empty">还没有频道。先创建停用频道，添加评论与回复模板后再启用。</p> : state.topics.map(topic => <div className="list-row" key={topic.id}><strong>{topic.name}</strong><span>{topic.keywords.join(' / ')}</span><span className="tag">{topic.enabled ? '已启用' : '已暂停'}</span></div>)}</section><section><h2>最近评论 <small>仅含已确认发送成功的评论与回复</small></h2><RecentComments rows={state.recentComments} /></section></>;
+function Dashboard({state,connection}:{state:State;connection:ConnectionState}){
+ const [tick,setTick]=useState(()=>performance.now());
+ useEffect(()=>{const timer=setInterval(()=>setTick(performance.now()),1000);return()=>clearInterval(timer);},[]);
+ const now=serverTime({serverNow:state.serverNow,receivedAt:state.receivedAt},tick);
+ return <><RuntimePanel display={state.display} connection={connection} now={now}/><section><h2>最近评论 <small>仅含已确认成功的评论与回复</small></h2><RecentComments rows={state.recentComments}/></section></>;
 }
 const compact = new Intl.NumberFormat('zh-CN',{ notation: 'compact', maximumFractionDigits: 1 });
 function commentUrl(row: RecentComment) {
@@ -146,7 +136,7 @@ function Plans({ state,mutate,busy }: { state:State;mutate:Mutate;busy:boolean }
 }
 function Templates({ state,mutate,busy }: { state: State;mutate: Mutate;busy: boolean }) {
   const [draft,setDraft] = useState<Omit<Template,'id'> & { id?: number }>({ topicId: state.topics[0]?.id ?? 0, kind: 'comment', text: '', enabled: true });
-  return <><p>模板直接绑定频道。评论与回复各自管理；连续相同内容会安全跳过。</p><section className="editor"><h2>{draft.id ? '编辑模板' : '添加模板'}</h2><form onSubmit={event => { event.preventDefault(); void mutate(draft.id ? `/templates/${draft.id}` : '/templates',draft.id ? 'PUT' : 'POST',draft).then(() => setDraft({ ...draft, id: undefined, text: '' })).catch(() => {}); }}><div className="form-grid"><label>所属频道<select required value={draft.topicId} onChange={e => setDraft({ ...draft, topicId: Number(e.target.value) })}><option value="0" disabled>请选择频道</option>{state.topics.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>类型<select value={draft.kind} onChange={e => setDraft({ ...draft, kind: e.target.value === 'reply' ? 'reply' : 'comment' })}><option value="comment">视频评论模板</option><option value="reply">普通评论回复模板</option></select></label></div><label>内容<textarea required maxLength={300} value={draft.text} onChange={e => setDraft({ ...draft, text: e.target.value })} /></label><label className="check"><input type="checkbox" checked={draft.enabled} onChange={e => setDraft({ ...draft, enabled: e.target.checked })} />启用模板</label><button className="primary" disabled={busy || !state.topics.length}>保存模板</button></form></section><section>{state.templates.map(template => <div className="list-row template-row" key={template.id}><div><strong>{template.text}</strong><p className="muted">{state.topics.find(t => t.id === template.topicId)?.name} / {template.kind === 'comment' ? '视频评论' : '用户回复'} / {template.enabled ? '启用' : '禁用'}</p></div><div className="actions"><button onClick={() => setDraft(template)}>编辑</button><button disabled={busy} onClick={() => { void mutate(`/templates/${template.id}`,'PUT',{ ...template, enabled: !template.enabled }).catch(() => {}); }}>{template.enabled ? '禁用' : '启用'}</button><button className="danger" disabled={busy} onClick={() => { void mutate(`/templates/${template.id}`,'DELETE').catch(() => {}); }}>删除</button></div></div>)}</section></>;
+  return <><p>模板直接绑定频道。评论与回复各自管理；相同文字可用于不同视频，已有计划使用入池时保存的快照。</p><section className="editor"><h2>{draft.id ? '编辑模板' : '添加模板'}</h2><form onSubmit={event => { event.preventDefault(); void mutate(draft.id ? `/templates/${draft.id}` : '/templates',draft.id ? 'PUT' : 'POST',draft).then(() => setDraft({ ...draft, id: undefined, text: '' })).catch(() => {}); }}><div className="form-grid"><label>所属频道<select required value={draft.topicId} onChange={e => setDraft({ ...draft, topicId: Number(e.target.value) })}><option value="0" disabled>请选择频道</option>{state.topics.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>类型<select value={draft.kind} onChange={e => setDraft({ ...draft, kind: e.target.value === 'reply' ? 'reply' : 'comment' })}><option value="comment">视频评论模板</option><option value="reply">普通评论回复模板</option></select></label></div><label>内容<textarea required maxLength={300} value={draft.text} onChange={e => setDraft({ ...draft, text: e.target.value })} /></label><label className="check"><input type="checkbox" checked={draft.enabled} onChange={e => setDraft({ ...draft, enabled: e.target.checked })} />启用模板</label><button className="primary" disabled={busy || !state.topics.length}>保存模板</button></form></section><section>{state.templates.map(template => <div className="list-row template-row" key={template.id}><div><strong>{template.text}</strong><p className="muted">{state.topics.find(t => t.id === template.topicId)?.name} / {template.kind === 'comment' ? '视频评论' : '用户回复'} / {template.enabled ? '启用' : '禁用'}</p></div><div className="actions"><button onClick={() => setDraft(template)}>编辑</button><button disabled={busy} onClick={() => { void mutate(`/templates/${template.id}`,'PUT',{ ...template, enabled: !template.enabled }).catch(() => {}); }}>{template.enabled ? '禁用' : '启用'}</button><button className="danger" disabled={busy} onClick={() => { void mutate(`/templates/${template.id}`,'DELETE').catch(() => {}); }}>删除</button></div></div>)}</section></>;
 }
 function ActivityTable({ rows }: { rows: Activity[] }) {
   return !rows.length ? <p className="empty">暂无活动。默认不会自动巡逻。</p> : <div className="table-scroll"><table><thead><tr><th>时间 / 频道</th><th>关键词 / 视频 / UP 主</th><th>动作 / 内容 / 对象</th><th>结果</th></tr></thead><tbody>{rows.map((row,index) => <tr key={row.id ?? index}><td>{new Date(row.time).toLocaleString('zh-CN')}<small>{row.topic}</small></td><td>{row.bvid ? <a target="_blank" rel="noreferrer" href={`https://www.bilibili.com/video/${encodeURIComponent(row.bvid)}`}>{row.title || row.bvid}</a> : '—'}<small>{row.keyword} {row.author && `· UP ${row.author}`}</small></td><td><span className="tag">{labels[row.action] ?? row.action}</span><small>{row.content} {row.target && `→ @${row.target}`}</small></td><td>{row.result}<small className="error">{row.error}</small></td></tr>)}</tbody></table></div>;
