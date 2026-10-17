@@ -5,6 +5,7 @@ import { Store, STARTUP_PAUSE } from './store.js';
 
 export class Scheduler {
   private active?: Promise<void>;
+  private readonly starts=new Set<Promise<void>>();
   private timer?: NodeJS.Timeout;
   private generation=0;
   private nextLoginCheck=0;
@@ -45,27 +46,46 @@ export class Scheduler {
   }
   startTimer(){this.timer=setInterval(()=>void this.tick(),1000);}
   async pause(reason='手动暂停'){
-    this.generation++;
-    const wasActive=!!this.active;
+    const generation=++this.generation;
+    const pending=[...this.starts,...(this.active?[this.active]:[])];
     const settings=this.store.settings();settings.running=false;settings.pauseReason=reason;this.store.saveSettings(settings);
-    this.setStatus(wasActive?'pause_requested':'paused',this.reasonCodeForPause(reason),reason,{nextAction:{kind:'manual_action',at:null},inFlight:wasActive,pauseRequested:wasActive});
+    this.setStatus(pending.length?'pause_requested':'paused',this.reasonCodeForPause(reason),reason,{nextAction:{kind:'manual_action',at:null},inFlight:pending.length>0,pauseRequested:pending.length>0});
+    await Promise.allSettled(pending);
+    if(generation===this.generation)this.setStatus('paused',this.reasonCodeForPause(reason),reason,{nextAction:{kind:'manual_action',at:null}});
+  }
+  run():Promise<void>{
+    // Establish ownership before the first await; a later pause always wins.
+    const generation=++this.generation;
+    const settings=this.store.settings();settings.running=false;settings.pauseReason='启动检查中';this.store.saveSettings(settings);
+    const task=this.start(generation);
+    this.starts.add(task);
+    void task.then(()=>this.starts.delete(task),()=>this.starts.delete(task));
+    return task;
+  }
+  private async start(generation:number){
     await this.active;
-    if(!this.active)this.setStatus('paused',this.reasonCodeForPause(reason),reason,{nextAction:{kind:'manual_action',at:null}});
-  }
-  async run(){
-    await this.pause();const generation=this.generation;this.setStatus('checking_login','none','正在检查登录状态',{nextAction:{kind:'login_check',at:null},timeoutAt:this.clock()+this.requestTimeoutMs,inFlight:true});
-    let account:Account;
-    try{account=await this.bili.checkLogin();}catch(error){this.setStatus('manual_review',error instanceof BiliError&&error.kind==='risk'?'risk_paused':'auth_required',error instanceof Error?error.message:'登录检查失败',{nextAction:{kind:'manual_action',at:null}});throw error;}
     if(generation!==this.generation)return;
-    const settings=this.store.settings();settings.account=account;this.store.saveSettings(settings);
-    if(!account.loggedIn||!account.uid)throw new BiliError('auth');
-    const binding=this.store.accountBinding();
-    if(!binding){const result=this.store.bindAccount(account.uid,true);if(!result.ok){settings.pauseReason=result.reason;this.store.saveSettings(settings);throw new BiliError('auth','unknown','not_applicable','account_binding_required',undefined,result.reason);}}
-    else if(!binding.verified||binding.uid!==account.uid){settings.pauseReason='账号 UID 与数据库绑定不一致，请人工确认';this.store.saveSettings(settings);throw new BiliError('auth','unknown','not_applicable','account_uid_mismatch',undefined,settings.pauseReason);}
-    settings.running=true;settings.pauseReason='';settings.failures=0;settings.retryAt=0;settings.readFailures=0;settings.readRetryAt=0;
-    this.nextLoginCheck=this.clock()+300000;this.store.saveSettings(settings);this.waitingStatus();
+    this.setStatus('checking_login','none','正在检查登录状态',{nextAction:{kind:'login_check',at:null},inFlight:true});
+    try {
+      const account=await this.bili.checkLogin();
+      if(generation!==this.generation)return;
+      const settings=this.store.settings();settings.account=account;this.store.saveSettings(settings);
+      if(!account.loggedIn||!account.uid)throw new BiliError('auth');
+      const binding=this.store.accountBinding();
+      if(!binding){const result=this.store.bindAccount(account.uid,true);if(!result.ok)throw new BiliError('auth','unknown','not_applicable','account_binding_required',undefined,result.reason);}
+      else if(!binding.verified||binding.uid!==account.uid)throw new BiliError('auth','unknown','not_applicable','account_uid_mismatch',undefined,'账号 UID 与数据库绑定不一致，请人工确认');
+      if(generation!==this.generation)return;
+      settings.running=true;settings.pauseReason='';settings.failures=0;settings.retryAt=0;settings.readFailures=0;settings.readRetryAt=0;
+      this.nextLoginCheck=this.clock()+300000;this.store.saveSettings(settings);this.waitingStatus();
+    }catch(error){
+      if(generation!==this.generation)return;
+      const failure=error instanceof BiliError?error:new BiliError('api');
+      const settings=this.store.settings();settings.pauseReason=failure.message;this.store.saveSettings(settings);
+      this.setStatus('manual_review',failure.kind==='risk'?'risk_paused':failure.kind==='auth'?'auth_required':'manual_paused',failure.message,{nextAction:{kind:'manual_action',at:null}});
+      throw error;
+    }
   }
-  tick(){if(this.active)return this.active;this.active=this.cycle().finally(()=>{this.active=undefined;});return this.active;}
+  tick(){if(this.starts.size)return Promise.resolve();if(this.active)return this.active;this.active=this.cycle().finally(()=>{this.active=undefined;});return this.active;}
   saveTopic(config:TopicConfig,id?:number){
     if(config.enabled&&!id)throw new Error('新频道请先保存为停用状态，添加评论和回复模板后再启用');
     if(config.enabled&&id){const current=this.store.templates().filter(t=>t.topicId===id&&t.enabled);if(!current.some(t=>t.kind==='comment')||!current.some(t=>t.kind==='reply'))throw new Error('启用频道前需要至少一个评论模板和一个回复模板');}
