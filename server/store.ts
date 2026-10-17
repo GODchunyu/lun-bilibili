@@ -389,13 +389,13 @@ export class Store {
       const r=z.object({action:interactionActionSchema,n:z.number()}).parse(raw);success[r.action]+=r.n;
     }
     const due=this.dueInteractionPlans(now,101);
-    const future=this.db.prepare("SELECT * FROM interaction_plans WHERE state='scheduled' AND due_at>? ORDER BY due_at,id LIMIT 3").all(now).map(r=>this.mapPlan(r));
+    const future=this.db.prepare("SELECT * FROM interaction_plans WHERE state='scheduled' AND due_at>? ORDER BY due_at,id LIMIT 101").all(now).map(r=>this.mapPlan(r));
     const review=this.db.prepare(`SELECT p.*,a.status AS latest_status,a.request_in_flight AS latest_in_flight FROM interaction_plans p LEFT JOIN interaction_attempts a ON a.id=(SELECT a2.id FROM interaction_attempts a2 WHERE a2.plan_id=p.id ORDER BY a2.attempt_no DESC LIMIT 1)
       WHERE p.state IN ('uncertain','manual_review','waiting_template') ORDER BY CASE p.state WHEN 'uncertain' THEN 0 WHEN 'manual_review' THEN 1 ELSE 2 END,p.id LIMIT 8`).all().map(raw=>{
         const r=z.object({latest_status:z.string().nullable(),latest_in_flight:z.number().nullable()}).parse(raw);
         return {plan:this.mapPlan(raw),requestInFlight:r.latest_in_flight===1,canResolve:['uncertain','manual_review'].includes(r.latest_status??'')&&r.latest_in_flight===0};
       });
-    const poll=this.db.prepare("SELECT min(coalesce(p.next_prepare_at,?)) AS at FROM interaction_plans p JOIN interaction_attempts a ON a.plan_id=p.id WHERE p.state='uncertain' AND a.request_in_flight=1").get(now);
+    const poll=this.db.prepare("SELECT min(coalesce(p.next_prepare_at,?)) AS at FROM interaction_plans p JOIN interaction_attempts a ON a.plan_id=p.id WHERE p.state='uncertain' AND a.status='uncertain' AND a.request_in_flight=1 AND a.attempt_no=(SELECT max(a2.attempt_no) FROM interaction_attempts a2 WHERE a2.plan_id=p.id)").get(now);
     return {now,settings,topics,queue:this.queueSummary(now),binding:this.accountBinding(),due,future,inFlightCount:countRow.parse(this.db.prepare('SELECT count(*) n FROM interaction_attempts WHERE request_in_flight=1').get()).n,pollAt:z.object({at:z.number().nullable()}).parse(poll).at,review,usage,success};
   }
   legacyOwnershipPending() {

@@ -57,13 +57,13 @@ function App() {
   const mutate: Mutate = async (path,method,body) => {
     if(connection!=='fresh'&&!(path==='/scheduler'&&(body as {running?:boolean})?.running===false))throw new Error('请等待运行状态更新后再操作');
     setBusy(true); setNotice('');
-    try { await api(path,method,body); await refresh(); setNotice('已保存'); }
+    try { await api(path,method,body); await refresh(); setNotice(path==='/scheduler'?'':'已保存'); }
     catch (error) { setNotice(error instanceof Error ? error.message : '请求失败'); throw error; }
     finally { setBusy(false); }
   };
   return <div className="shell">
-    <aside><a className="brand" href="/dashboard">Yui<span>bilibili patrol</span></a><div className="nav-label">工作空间</div><nav>{Object.entries(pages).map(([key,label],index) => <a key={key} href={`/${key}`} className={page === key ? 'selected' : ''} onClick={event => { event.preventDefault(); setPage(key as Page); history.pushState(null,'',`/${key}`);window.dispatchEvent(new PopStateEvent('popstate')); }}><span>0{index+1}</span>{label}</a>)}</nav><div className="sidebar-bottom"><span className={`dot ${connection==='fresh'&&state?.settings.running ? 'running' : ''}`} />{connection!=='fresh'?'状态待更新':state?.settings.running ? '巡逻中' : '已暂停'}<button onClick={() => setDark(!dark)}>{dark ? '浅色模式' : '深色模式'}</button></div></aside>
-    <main><header><div><div className="eyebrow">YUI / {page.toUpperCase()}</div><h1>{pages[page]}</h1></div>{state && <button disabled={busy||(!state.settings.running&&connection!=='fresh')} className={state.settings.running ? '' : 'primary'} onClick={() => { void mutate('/scheduler','POST',{ running: !state.settings.running }).catch(() => {}); }}>{state.settings.running ? '暂停巡逻' : '启动巡逻'}</button>}</header>
+    <aside><a className="brand" href="/dashboard">Yui<span>bilibili patrol</span></a><div className="nav-label">工作空间</div><nav>{Object.entries(pages).map(([key,label],index) => <a key={key} href={`/${key}`} className={page === key ? 'selected' : ''} onClick={event => { event.preventDefault(); setPage(key as Page); history.pushState(null,'',`/${key}`);window.dispatchEvent(new PopStateEvent('popstate')); }}><span>0{index+1}</span>{label}</a>)}</nav><div className="sidebar-bottom"><span className={`dot ${connection==='fresh'&&state?.settings.running ? 'running' : ''}`} />{connection!=='fresh'?'状态待更新':state?.display.control.pauseRequested?'暂停中':state?.display.control.starting?'启动检查中':state?.settings.running?'巡逻中':'已暂停'}<button onClick={() => setDark(!dark)}>{dark ? '浅色模式' : '深色模式'}</button></div></aside>
+    <main><header><div><div className="eyebrow">YUI / {page.toUpperCase()}</div><h1>{pages[page]}</h1></div>{state && <button disabled={busy||state.display.control.pauseRequested||state.display.control.starting||(!state.settings.running&&connection!=='fresh')} className={state.settings.running ? '' : 'primary'} onClick={() => { void mutate('/scheduler','POST',{ running: !state.settings.running }).catch(() => {}); }}>{state.display.control.pauseRequested?'正在暂停…':state.display.control.starting?'正在检查…':state.settings.running?'暂停巡逻':'启动巡逻'}</button>}</header>
       {notice && <div className="notice" role="status">{notice}</div>}
       {!state ? <p role="status">{connection==='incompatible'?'页面与服务版本不兼容，请更新服务或刷新页面。':connection==='offline'?'无法连接本机服务，正在等待恢复。':'正在连接本机服务…'}</p> : <>
         {!state.settings.account.loggedIn && <div className="warning">{state.settings.account.message} · {state.settings.account.message === '登录状态待检查' ? '启动后会自动检查，稍候即可。' : '请到设置登录；未登录不会互动。'}</div>}
@@ -122,9 +122,9 @@ function Plans({state,mutate,busy}:{state:State;mutate:Mutate;busy:boolean}){
  const [filter,setFilter]=useState(initial.filter);const [offset,setOffset]=useState(initial.offset);const [selected,setSelected]=useState(initial.selected);
  const [rows,setRows]=useState<InteractionPlan[]>([]);const [total,setTotal]=useState(0);const [detail,setDetail]=useState<z.infer<typeof planDetailSchema>>();
  const [commentDraft,setCommentDraft]=useState('');const [replyDraft,setReplyDraft]=useState('');const [error,setError]=useState('');const [reload,setReload]=useState(0);const [acting,setActing]=useState(false);
- const drafts=useRef(new Map<number,{comment:string;reply:string}>());const locked=busy||acting;
+ const drafts=useRef(new Map<number,{comment:string;reply:string}>());const selectedRef=useRef(selected);selectedRef.current=selected;const locked=busy||acting;
  const navigate=(nextFilter:string,id?:number,start=0)=>{history.pushState(null,'',planHref(nextFilter,id,start));window.dispatchEvent(new PopStateEvent('popstate'));};
- useEffect(()=>{const read=()=>{const r=planRoute(window.location.search);setFilter(r.filter);setOffset(r.offset);setSelected(r.selected);};window.addEventListener('popstate',read);return()=>window.removeEventListener('popstate',read);},[]);
+ useEffect(()=>{const read=()=>{const r=planRoute(window.location.search);selectedRef.current=r.selected;setFilter(r.filter);setOffset(r.offset);setSelected(r.selected);};window.addEventListener('popstate',read);return()=>window.removeEventListener('popstate',read);},[]);
  useEffect(()=>{
   let alive=true;let pending=false;
   const load=async()=>{if(pending)return;pending=true;try{const q=new URLSearchParams({limit:'50',offset:String(offset)});if(filter)q.set('state',filter);const page=z.object({items:z.array(interactionPlanSchema),total:z.number()}).parse(await api(`/plans?${q}`));if(alive){setRows(page.items);setTotal(page.total);}}catch(e){if(alive)setError(e instanceof Error?e.message:'列表加载失败');}finally{pending=false;}};
@@ -137,7 +137,7 @@ function Plans({state,mutate,busy}:{state:State;mutate:Mutate;busy:boolean}){
   void load();const timer=setInterval(()=>void load(),5000);return()=>{alive=false;clearInterval(timer);};
  },[selected,reload]);
  const perform=async(task:()=>Promise<void>)=>{if(locked)return;setActing(true);setError('');try{await task();setReload(n=>n+1);}catch(e){setError(e instanceof Error?e.message:'操作失败，请重新核对状态');}finally{setActing(false);}};
- const freshDetail=async()=>{if(selected===undefined)throw Error('请先选择计划');const current=planDetailSchema.parse(await api(`/plans/${selected}`));setDetail(current);return current;};
+ const freshDetail=async()=>{if(selected===undefined)throw Error('请先选择计划');const id=selected;const current=planDetailSchema.parse(await api(`/plans/${id}`));if(selectedRef.current!==id)throw Error('已切换计划，此次操作已取消，请重新核对');setDetail(current);return current;};
  const saveTemplates=async()=>{const current=await freshDetail();await mutate(`/plans/${current.plan.id}/templates`,'PUT',{version:current.plan.version,commentTemplates:commentDraft.split('\n').map(s=>s.trim()).filter(Boolean),replyTemplates:replyDraft.split('\n').map(s=>s.trim()).filter(Boolean)});drafts.current.delete(current.plan.id);};
  const resolve=async(action:'succeeded'|'not_sent')=>{
   const evidence=prompt(action==='succeeded'?'请填写已发送的核查依据，例如评论链接':'请填写原请求已结束且未发送的核查依据。看不到评论本身不足以证明未发送。');if(!evidence?.trim())return;

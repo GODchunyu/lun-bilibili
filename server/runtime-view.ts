@@ -61,14 +61,14 @@ function deriveSearch(f:RuntimeFacts):DisplayChannel {
  return candidates.find(c=>c.state==='ready')??candidates.filter(c=>c.at!==null).sort((a,b)=>a.at!-b.at!)[0]??candidates[0];
 }
 function deriveInteraction(f:RuntimeFacts):DisplayChannel {
- if(f.inFlightCount){const c=channel([reason('unconfirmed_request','上一条请求尚未确认结束，其他评论暂缓')]);c.timeKind='check';c.at=f.settings.retryAt>f.now?f.settings.retryAt:f.pollAt;c.reasons.push(reason('poll','下次检查原请求结果',c.at));return c;}
+ if(f.inFlightCount){const c=channel([reason('unconfirmed_request','上一条请求尚未确认结束，其他评论暂缓')]);c.timeKind='check';c.at=f.pollAt===null?null:Math.max(f.now,f.settings.retryAt,f.pollAt);c.reasons.push(reason('poll','下次检查原请求结果',c.at));return c;}
  const window=f.due.slice(0,100);const derived=window.map(p=>planChannel(f,p));
  const ready=derived.find(c=>c.state==='ready');if(ready)return ready;
- const future=f.future.map(p=>planChannel(f,p));
+ const future=f.future.slice(0,100).map(p=>planChannel(f,p));
  const timed=[...derived,...future].filter(c=>c.at!==null).sort((a,b)=>a.at!-b.at!);
  if(f.due.length>100){const c=channel([reason('scan_window','当前调度批次受限，后续候选尚未选中')]);if(timed.length)c.reasons.push(...timed[0].reasons);return c;}
  if(timed.length)return timed[0];
- if(derived.length)return derived[0];if(future.length)return future[0];
+ if(derived.length)return derived[0];if(f.future.length>100)return channel([reason('observation_window','近期候选受限，需继续检查后续安排')]);if(future.length)return future[0];
  if(f.queue.waitingTemplate)return channel([reason('template','等待补充计划模板')]);
  if(f.queue.pausedChannel)return channel([reason('channel_disabled','计划所属频道已暂停')]);
  return {state:'idle',title:'暂无可执行计划，等待搜索发现',timeKind:'unknown',at:null,reasons:[],candidate:null};
@@ -89,9 +89,10 @@ export function buildRuntimeDisplay(f:RuntimeFacts,control:RuntimeControl,writes
  else if(interaction.state==='waiting')headline={title:'巡逻中 · '+interaction.title,detail:f.queue.due?`有${f.queue.due}条计划已到执行时间；安排基于当前已知任务`:'搜索与互动按各自安排检查',tone:'normal'};
  if(operation)headline={title:(control.pauseRequested?'暂停中 · ':!s.running&&!control.starting?'巡逻已暂停 · ':'')+operation.label,detail:operation.title??operation.keyword??'等待当前操作返回结果',tone:control.pauseRequested?'paused':'normal'};
  const items:RuntimeDisplay['attention']['items']=f.review.map(({plan,requestInFlight,canResolve})=>({key:'plan-'+plan.id,label:plan.state==='uncertain'?'这条互动需要核实发送结果':plan.state==='waiting_template'?'需要补充计划模板':'这条计划需要人工处理',detail:requestInFlight?'原请求结束尚未确认，暂不能确认未发送':'请进入详情核对；未看到评论不等于未发送',href:`/plans?state=${plan.state}&planId=${plan.id}`,planId:plan.id,canResolve}));
- if(!s.account.loggedIn)items.unshift({key:'account',label:'账号需要登录或检查',detail:'请在设置页检查账号',href:'/settings',canResolve:false});
+ const accountNeedsReview=!s.account.loggedIn||!!f.binding&&(!f.binding.verified||f.binding.uid!==s.account.uid);
+ if(accountNeedsReview)items.unshift({key:'account',label:'账号需要登录或检查',detail:'请在设置页检查账号',href:'/settings',canResolve:false});
  if(!writesEnabled)items.push({key:'writes',label:'真实写操作未开启',detail:'请在设置页查看说明',href:'/settings',canResolve:false});
  const reviewTotal=f.queue.uncertain+f.queue.manualReview+f.queue.waitingTemplate;
  const upcoming=[...f.due,...f.future].filter(p=>!p.cancelRequested&&!p.orphaned&&p.state==='scheduled').slice(0,3).map(p=>displayPlan(p,f.now));
- return {schemaVersion:1,instanceId,snapshotSeq,serverNow:f.now,control:{running:s.running,starting:control.starting,pauseRequested:control.pauseRequested,writesEnabled},operation,headline,search,interaction,attention:{total:reviewTotal+(!s.account.loggedIn?1:0)+(!writesEnabled?1:0),waitingEnd:f.inFlightCount,items:items.slice(0,8)},upcoming,totals:{commentSucceeded:f.success.comment,replySucceeded:f.success.reply,pending:f.queue.pending,needReview:reviewTotal,claimed:f.queue.claimed}};
+ return {schemaVersion:1,instanceId,snapshotSeq,serverNow:f.now,control:{running:s.running,starting:control.starting,pauseRequested:control.pauseRequested,writesEnabled},operation,headline,search,interaction,attention:{total:reviewTotal+(accountNeedsReview?1:0)+(!writesEnabled?1:0),waitingEnd:f.inFlightCount,items:items.slice(0,8)},upcoming,totals:{commentSucceeded:f.success.comment,replySucceeded:f.success.reply,pending:f.queue.pending,needReview:reviewTotal,claimed:f.queue.claimed}};
 }

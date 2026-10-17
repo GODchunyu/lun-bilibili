@@ -251,6 +251,7 @@ export class Scheduler {
         this.setStatus('reading_comments','none','正在读取回复对象',{nextAction:{kind:'interaction',at:plan.dueAt},current:{planId:plan.id,action:'reply',bvid:plan.bvid,title:this.planTitle(plan.video,plan.bvid),keyword:plan.keyword},inFlight:true});
         try{candidates=(await this.observeOperation('reading_comments','正在寻找回复对象',{planId:plan.id,title:this.planTitle(plan.video,plan.bvid)},()=>this.bili.comments(plan.bvid))).filter(value=>safeComment(value)&&value.uid!==this.store.account().uid);}
         catch(error){this.store.recordPlanPreparationFailure(plan.id,plan.version,now,now+86400000,error instanceof BiliError?error.errorCode||'prepare_failed':'prepare_failed','回复对象读取失败');this.fail(error,topic,{bvid:plan.bvid},'read');continue;}
+        if(!this.live(generation))return;
         if(candidates.length){const chosen=candidates[Math.floor(this.random()*candidates.length)];target=chosen.user;targetId=chosen.rpid;targetUid=chosen.uid??'';}
         else{effective='comment';fallback='成功读取评论但没有合格对象';}
       }
